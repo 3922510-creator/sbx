@@ -131,7 +131,13 @@ init_sbx_config() {
     }
   ],
   "route": {
-    "rules": []
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "action": "sniff"
+      }
+    ],
+    "final": "direct"
   }
 }
 EOF
@@ -158,6 +164,52 @@ sbx_backup_config() {
 sbx_check_config() {
     if [ ! -x "$BIN_FILE" ]; then return 0; fi
     "$BIN_FILE" check -c "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 统一安全写入与核心预检函数：
+# 1. 只有 candidate 通过 sing-box check，才允许覆盖 CONFIG_FILE
+# 2. 预检不通过时，打印完整错误、清除临时文件，原配置 100% 不动
+# 3. 覆盖后启动，若服务异常拉起失败，自动回滚上一次备份
+sbx_apply_config_safe() {
+    local candidate="$1"
+    if [ ! -s "$candidate" ]; then
+        printf '%b[错误] 待应用配置文件为空。%b\n' "$RED" "$NC"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    # 1. 核心预检
+    local check_err
+    if ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
+        printf '\n%b[核心预检失败] 节点配置未通过 Sing-box 核心校验，已拒绝写入，原配置未做任何修改：%b\n' "$RED$BOLD" "$NC"
+        printf '%b%s%b\n' "$YELLOW" "$check_err" "$NC"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    # 2. 备份原配置
+    sbx_backup_config
+
+    # 3. 原子替换
+    mv -f "$candidate" "$CONFIG_FILE"
+
+    # 4. 重启服务
+    sbx_svc_action restart >/dev/null 2>&1 || true
+
+    # 5. 服务拉起校验（若拉起失败，自动回滚最近一次备份）
+    sleep 0.5
+    if [ "$INIT_SYS" = "systemd" ] && ! systemctl is-active --quiet sbx.service 2>/dev/null; then
+        local latest_bak
+        latest_bak=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | head -1)
+        if [ -n "$latest_bak" ]; then
+            printf '\n%b[警告] 服务启动异常，正在自动回滚至上一版本配置...%b\n' "$RED" "$NC"
+            cp -pf "$latest_bak" "$CONFIG_FILE"
+            sbx_svc_action restart >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
+
+    return 0
 }
 
 sbx_svc_action() {

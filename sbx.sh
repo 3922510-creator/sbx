@@ -957,7 +957,13 @@ init_sbx_config() {
     }
   ],
   "route": {
-    "rules": []
+    "auto_detect_interface": true,
+    "rules": [
+      {
+        "action": "sniff"
+      }
+    ],
+    "final": "direct"
   }
 }
 EOF
@@ -984,6 +990,52 @@ sbx_backup_config() {
 sbx_check_config() {
     if [ ! -x "$BIN_FILE" ]; then return 0; fi
     "$BIN_FILE" check -c "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+# 统一安全写入与核心预检函数：
+# 1. 只有 candidate 通过 sing-box check，才允许覆盖 CONFIG_FILE
+# 2. 预检不通过时，打印完整错误、清除临时文件，原配置 100% 不动
+# 3. 覆盖后启动，若服务异常拉起失败，自动回滚上一次备份
+sbx_apply_config_safe() {
+    local candidate="$1"
+    if [ ! -s "$candidate" ]; then
+        printf '%b[错误] 待应用配置文件为空。%b\n' "$RED" "$NC"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    # 1. 核心预检
+    local check_err
+    if ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
+        printf '\n%b[核心预检失败] 节点配置未通过 Sing-box 核心校验，已拒绝写入，原配置未做任何修改：%b\n' "$RED$BOLD" "$NC"
+        printf '%b%s%b\n' "$YELLOW" "$check_err" "$NC"
+        rm -f "$candidate"
+        return 1
+    fi
+
+    # 2. 备份原配置
+    sbx_backup_config
+
+    # 3. 原子替换
+    mv -f "$candidate" "$CONFIG_FILE"
+
+    # 4. 重启服务
+    sbx_svc_action restart >/dev/null 2>&1 || true
+
+    # 5. 服务拉起校验（若拉起失败，自动回滚最近一次备份）
+    sleep 0.5
+    if [ "$INIT_SYS" = "systemd" ] && ! systemctl is-active --quiet sbx.service 2>/dev/null; then
+        local latest_bak
+        latest_bak=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | head -1)
+        if [ -n "$latest_bak" ]; then
+            printf '\n%b[警告] 服务启动异常，正在自动回滚至上一版本配置...%b\n' "$RED" "$NC"
+            cp -pf "$latest_bak" "$CONFIG_FILE"
+            sbx_svc_action restart >/dev/null 2>&1 || true
+        fi
+        return 1
+    fi
+
+    return 0
 }
 
 sbx_svc_action() {
@@ -1145,8 +1197,7 @@ add_reality_node() {
     name="${name// /}"
     name="${name:-Reality-${port}}"
 
-    # 写入配置
-    sbx_backup_config
+    # 写入配置并交由核心预检引擎安全应用
     local tmp_conf
     tmp_conf=$(mktemp /tmp/sbx_conf_XXXXXX)
     jq --arg tag "$tag" \
@@ -1160,8 +1211,7 @@ add_reality_node() {
           "tag": $tag,
           "listen": "::",
           "listen_port": $port,
-          "sniff": true,
-          "sniff_override_destination": true,
+          "tcp_fast_open": true,
           "users": [{
             "uuid": $uuid,
             "flow": "xtls-rprx-vision"
@@ -1181,15 +1231,12 @@ add_reality_node() {
           }
        }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
 
-    if [ -s "$tmp_conf" ] && jq -e . "$tmp_conf" >/dev/null 2>&1; then
-        mv "$tmp_conf" "$CONFIG_FILE"
-    else
-        rm -f "$tmp_conf"
-        printf '%b[错误] 生成配置文件异常。%b\n' "$RED" "$NC"
-        pause_for_enter; return 1;
+    if ! sbx_apply_config_safe "$tmp_conf"; then
+        pause_for_enter
+        return 1
     fi
 
-    # 保存元数据
+    # 预检通过并应用成功后，持久化元数据
     local tmp_state
     tmp_state=$(mktemp /tmp/sbx_state_XXXXXX)
     jq --arg tag "$tag" \
@@ -1209,9 +1256,6 @@ add_reality_node() {
           "created_at": (now | todate)
        }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
     rm -f "$tmp_state"
-
-    # 重启并生效
-    sbx_svc_action restart >/dev/null 2>&1 || true
 
     printf '\n%b[5/5] 节点搭建成功！正在生成节点链接...%b\n\n' "$GREEN" "$NC"
     _show_node_by_tag "$tag"
@@ -1337,17 +1381,18 @@ manage_reality() {
                     sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
                     if confirm_action "确认删除节点: ${sel_name}？"; then
                         acquire_lock || continue
-                        sbx_backup_config
-                        # 从 config.json 移除
+                        # 从 config.json 移除候选并进行安全核心预检
                         local tmp_c tmp_s
                         tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                        rm -f "$tmp_c"
-                        # 从 state.json 移除
+                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
+                        if ! sbx_apply_config_safe "$tmp_c"; then
+                            pause_for_enter
+                            continue
+                        fi
+                        # 预检通过并应用后，同步从 state.json 移除
                         tmp_s=$(mktemp /tmp/sbx_s_XXXXXX)
                         jq --arg tag "$sel_tag" 'del(.nodes[$tag])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
                         rm -f "$tmp_s"
-                        sbx_svc_action restart >/dev/null 2>&1 || true
                         printf '%b[成功] 节点已删除！%b\n' "$GREEN" "$NC"
                         pause_for_enter
                     fi
@@ -1418,7 +1463,6 @@ manage_forward() {
                 }
 
                 local fwd_tag="fwd-${local_port}"
-                sbx_backup_config
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_fwd_XXXXXX)
                 jq --arg tag "$fwd_tag" \
@@ -1432,10 +1476,13 @@ manage_forward() {
                       "listen_port": $lp,
                       "override_address": $host,
                       "override_port": $dp
-                   }]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                rm -f "$tmp_c"
+                   }]' "$CONFIG_FILE" > "$tmp_c"
 
-                sbx_svc_action restart >/dev/null 2>&1 || true
+                if ! sbx_apply_config_safe "$tmp_c"; then
+                    pause_for_enter
+                    continue
+                fi
+
                 printf '\n%b[成功] 端口转发已添加: 本机 %s -> %s:%s%b\n' "$GREEN" "$local_port" "$dest_host" "$dest_port" "$NC"
                 pause_for_enter
                 ;;
@@ -1448,12 +1495,13 @@ manage_forward() {
                     local sel_tag="${fwd_rules[$((idx - 1))]}"
                     if confirm_action "确认删除规则: ${sel_tag}？"; then
                         acquire_lock || continue
-                        sbx_backup_config
                         local tmp_c
                         tmp_c=$(mktemp /tmp/sbx_fwd_del_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                        rm -f "$tmp_c"
-                        sbx_svc_action restart >/dev/null 2>&1 || true
+                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
+                        if ! sbx_apply_config_safe "$tmp_c"; then
+                            pause_for_enter
+                            continue
+                        fi
                         printf '%b[成功] 规则已删除！%b\n' "$GREEN" "$NC"
                         pause_for_enter
                     fi
@@ -1504,7 +1552,6 @@ manage_warp() {
                 priv_key=$("$BIN_FILE" generate wireguard-keypair 2>/dev/null | awk '/PrivateKey:/{print $2}' || openssl rand -base64 32)
                 pub_key="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 
-                sbx_backup_config
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_warp_XXXXXX)
                 jq --arg priv "$priv_key" \
@@ -1517,10 +1564,13 @@ manage_warp() {
                       "local_address": ["172.16.0.2/32"],
                       "private_key": $priv,
                       "peer_public_key": $pub
-                   }]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                rm -f "$tmp_c"
+                   }]' "$CONFIG_FILE" > "$tmp_c"
 
-                sbx_svc_action restart >/dev/null 2>&1 || true
+                if ! sbx_apply_config_safe "$tmp_c"; then
+                    pause_for_enter
+                    continue
+                fi
+
                 printf '\n%b[成功] WARP WireGuard 出口已注入并生效！%b\n' "$GREEN" "$NC"
                 pause_for_enter
                 ;;
@@ -1529,15 +1579,16 @@ manage_warp() {
                     printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
                     pause_for_enter; continue;
                 fi
-                sbx_backup_config
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
                 jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or (.domain_suffix? // []) != ["openai.com", "chatgpt.com", "ai.com"])] + [{
                       "domain_suffix": ["openai.com", "chatgpt.com", "ai.com", "oaistatic.com", "oaiusercontent.com"],
                       "outbound": "warp-out"
-                   }]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                rm -f "$tmp_c"
-                sbx_svc_action restart >/dev/null 2>&1 || true
+                   }]' "$CONFIG_FILE" > "$tmp_c"
+                if ! sbx_apply_config_safe "$tmp_c"; then
+                    pause_for_enter
+                    continue
+                fi
                 printf '\n%b[成功] OpenAI / ChatGPT 域名分流规则已生效！%b\n' "$GREEN" "$NC"
                 pause_for_enter
                 ;;
@@ -1546,28 +1597,30 @@ manage_warp() {
                     printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
                     pause_for_enter; continue;
                 fi
-                sbx_backup_config
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
                 jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or (.domain_suffix? // []) != ["netflix.com", "disneyplus.com"])] + [{
                       "domain_suffix": ["netflix.com", "nflxvideo.net", "disneyplus.com", "bamgrid.com"],
                       "outbound": "warp-out"
-                   }]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                rm -f "$tmp_c"
-                sbx_svc_action restart >/dev/null 2>&1 || true
+                   }]' "$CONFIG_FILE" > "$tmp_c"
+                if ! sbx_apply_config_safe "$tmp_c"; then
+                    pause_for_enter
+                    continue
+                fi
                 printf '\n%b[成功] 流媒体域名分流规则已生效！%b\n' "$GREEN" "$NC"
                 pause_for_enter
                 ;;
             4)
                 if confirm_action "彻底移除 WARP 出口与全部 WARP 关联分流规则？"; then
                     acquire_lock || continue
-                    sbx_backup_config
                     local tmp_c
                     tmp_c=$(mktemp /tmp/sbx_warp_del_XXXXXX)
                     jq '.outbounds = [.outbounds[] | select(.tag != "warp-out")] |
-                        .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                    rm -f "$tmp_c"
-                    sbx_svc_action restart >/dev/null 2>&1 || true
+                        .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]' "$CONFIG_FILE" > "$tmp_c"
+                    if ! sbx_apply_config_safe "$tmp_c"; then
+                        pause_for_enter
+                        continue
+                    fi
                     printf '\n%b[成功] WARP 配置已彻底清除！%b\n' "$GREEN" "$NC"
                     pause_for_enter
                 fi

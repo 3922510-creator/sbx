@@ -67,8 +67,7 @@ add_reality_node() {
     name="${name// /}"
     name="${name:-Reality-${port}}"
 
-    # 写入配置
-    sbx_backup_config
+    # 写入配置并交由核心预检引擎安全应用
     local tmp_conf
     tmp_conf=$(mktemp /tmp/sbx_conf_XXXXXX)
     jq --arg tag "$tag" \
@@ -82,8 +81,7 @@ add_reality_node() {
           "tag": $tag,
           "listen": "::",
           "listen_port": $port,
-          "sniff": true,
-          "sniff_override_destination": true,
+          "tcp_fast_open": true,
           "users": [{
             "uuid": $uuid,
             "flow": "xtls-rprx-vision"
@@ -103,15 +101,12 @@ add_reality_node() {
           }
        }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
 
-    if [ -s "$tmp_conf" ] && jq -e . "$tmp_conf" >/dev/null 2>&1; then
-        mv "$tmp_conf" "$CONFIG_FILE"
-    else
-        rm -f "$tmp_conf"
-        printf '%b[错误] 生成配置文件异常。%b\n' "$RED" "$NC"
-        pause_for_enter; return 1;
+    if ! sbx_apply_config_safe "$tmp_conf"; then
+        pause_for_enter
+        return 1
     fi
 
-    # 保存元数据
+    # 预检通过并应用成功后，持久化元数据
     local tmp_state
     tmp_state=$(mktemp /tmp/sbx_state_XXXXXX)
     jq --arg tag "$tag" \
@@ -131,9 +126,6 @@ add_reality_node() {
           "created_at": (now | todate)
        }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
     rm -f "$tmp_state"
-
-    # 重启并生效
-    sbx_svc_action restart >/dev/null 2>&1 || true
 
     printf '\n%b[5/5] 节点搭建成功！正在生成节点链接...%b\n\n' "$GREEN" "$NC"
     _show_node_by_tag "$tag"
@@ -259,17 +251,18 @@ manage_reality() {
                     sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
                     if confirm_action "确认删除节点: ${sel_name}？"; then
                         acquire_lock || continue
-                        sbx_backup_config
-                        # 从 config.json 移除
+                        # 从 config.json 移除候选并进行安全核心预检
                         local tmp_c tmp_s
                         tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c" && mv "$tmp_c" "$CONFIG_FILE"
-                        rm -f "$tmp_c"
-                        # 从 state.json 移除
+                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
+                        if ! sbx_apply_config_safe "$tmp_c"; then
+                            pause_for_enter
+                            continue
+                        fi
+                        # 预检通过并应用后，同步从 state.json 移除
                         tmp_s=$(mktemp /tmp/sbx_s_XXXXXX)
                         jq --arg tag "$sel_tag" 'del(.nodes[$tag])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
                         rm -f "$tmp_s"
-                        sbx_svc_action restart >/dev/null 2>&1 || true
                         printf '%b[成功] 节点已删除！%b\n' "$GREEN" "$NC"
                         pause_for_enter
                     fi
