@@ -663,43 +663,47 @@ EOF
     done
 }
 
-# ---------- 回程线路检测 ----------
+# ---------- BestTrace 回程线路路由测试 ----------
 check_return_route() {
-    menu_header "回程线路延迟与路由测试"
-    printf '  %b测试国内三大运营商主要骨干网回程延迟与连通性...%b\n\n' "$DIM" "$NC"
+    menu_header "BestTrace 回程线路路由测试"
+    printf '  %b测试国内四大骨干网 (电信/联通/移动/教育网) 的回程路由与线路质量...%b\n\n' "$CYAN" "$NC"
+    if ! confirm_action "从 besttrace.sh 下载并执行回程路由测试？" "y"; then return 0; fi
 
-    # 目标列表：名称|IP|运营商
-    local targets=(
-        "北京电信 163|219.141.136.12|电信"
-        "上海电信 CN2|58.32.0.1|电信CN2"
-        "广州电信|14.215.116.1|电信"
-        "北京联通 169|202.106.0.20|联通"
-        "上海联通 9929|210.13.66.238|联通A网"
-        "广州联通|210.21.196.6|联通"
-        "北京移动 CMI|211.136.25.153|移动"
-        "上海移动|221.183.55.0|移动"
-        "广州移动|120.196.165.7|移动"
-        "北京教育网|202.112.0.46|教育网"
-    )
-
-    printf "  %-16s %-18s %-10s %s\n" "目标节点" "目标 IP" "丢包率" "平均延迟 (RTT)"
-    print_divider
-
-    local item name ip isp stat loss avg
-    for item in "${targets[@]}"; do
-        IFS='|' read -r name ip isp <<< "$item"
-        stat=$(ping -c 3 -W 1 "$ip" 2>/dev/null)
-        if [ $? -eq 0 ]; then
-            loss=$(echo "$stat" | grep -o '[0-9]*% packet loss' | cut -d'%' -f1 || echo "0")
-            avg=$(echo "$stat" | awk -F'/' 'END{printf "%.1f ms", $5}' 2>/dev/null)
-            [ -n "$avg" ] || avg="N/A"
-            printf "  %-16s %-18s %-10s %b%s%b\n" "$name" "$ip" "${loss}%" "$GREEN" "$avg" "$NC"
+    printf '\n%b>>> 正在启动 BestTrace 回程测试引擎...%b\n\n' "$CYAN" "$NC"
+    local bt_tmp
+    bt_tmp=$(mktemp /tmp/sbx_bt_XXXXXX) || { printf '%b[错误] 无法创建临时文件。%b\n' "$RED" "$NC"; pause_for_enter; return; }
+    if wget -qO- https://besttrace.sh -O "$bt_tmp" 2>/dev/null || curl -fsSL --connect-timeout 10 https://besttrace.sh -o "$bt_tmp"; then
+        if grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$bt_tmp"; then
+            bash "$bt_tmp"
         else
-            printf "  %-16s %-18s %-10s %b超时/不可达%b\n" "$name" "$ip" "100%" "$RED" "$NC"
+            printf '%b[错误] 脚本内容校验失败。%b\n' "$RED" "$NC"
         fi
-    done
-    print_divider
+    else
+        printf '%b[错误] 下载 besttrace.sh 失败，请检查网络连通性。%b\n' "$RED" "$NC"
+    fi
+    rm -f "$bt_tmp"
+    pause_for_enter
+}
 
+# ---------- 流媒体与 IP 质量检测 ----------
+check_media_unlock() {
+    menu_header "流媒体解锁与 IP 质量检测"
+    printf '  %b启动权威流媒体与 IP 解锁检测引擎 (Check.Place)...%b\n\n' "$CYAN" "$NC"
+    if ! confirm_action "下载并执行流媒体解锁测试脚本？" "y"; then return 0; fi
+
+    printf '\n%b>>> 正在启动检测引擎...%b\n\n' "$CYAN" "$NC"
+    local media_tmp
+    media_tmp=$(mktemp /tmp/sbx_media_XXXXXX) || { printf '%b[错误] 无法创建临时文件。%b\n' "$RED" "$NC"; pause_for_enter; return; }
+    if curl -fsSL --connect-timeout 10 --max-time 60 https://Check.Place -o "$media_tmp" 2>/dev/null || wget -qO- https://Check.Place -O "$media_tmp" 2>/dev/null; then
+        if grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$media_tmp"; then
+            bash "$media_tmp"
+        else
+            printf '%b[错误] 检测脚本内容校验失败。%b\n' "$RED" "$NC"
+        fi
+    else
+        printf '%b[错误] 下载检测脚本失败，请检查网络出墙连通性。%b\n' "$RED" "$NC"
+    fi
+    rm -f "$media_tmp"
     pause_for_enter
 }
 
@@ -1672,21 +1676,21 @@ show_main_menu() {
 
     printf '\n  %b[ 网络优化与安全 ]%b\n' "$CYAN$BOLD" "$NC"
     menu_pair 6 "Swap 虚拟内存" 7 "DNS 优化与修改"
-    menu_pair 8 "TCP 调优与 BBR" 9 "回程线路测试"
-    menu_single 10 "UFW 防火墙端口管理"
+    menu_pair 8 "TCP 调优与 BBR" 9 "BestTrace 回程测试"
+    menu_pair 10 "流媒体与 IP 质量" 11 "UFW 防火墙端口管理"
 
     printf '\n  %b[ Sing-box 代理 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_pair 11 "VLESS-Reality 节点" 12 "TCP/UDP 端口转发"
-    menu_pair 13 "WARP 出口与分流" 14 "核心与服务维护"
+    menu_pair 12 "VLESS-Reality 节点" 13 "TCP/UDP 端口转发"
+    menu_pair 14 "WARP 出口与分流" 15 "核心与服务维护"
 
     printf '\n  %b[ 脚本管理 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_single 15 "彻底卸载 SBX (清除全部配置与残留)"
+    menu_single 16 "彻底卸载 SBX (清除全部配置与残留)"
 
     printf '\n'
     print_divider
     printf "  %b 0.%b 退出脚本\n\n" "$YELLOW" "$NC"
 
-    _read_menu_choice MAIN_OPT "> 请选择操作 [0-15]: "
+    _read_menu_choice MAIN_OPT "> 请选择操作 [0-16]: "
     case "$MAIN_OPT" in
         1) system_overview ;;
         2) system_update ;;
@@ -1697,18 +1701,19 @@ show_main_menu() {
         7) optimize_dns ;;
         8) manage_tcp_bbr ;;
         9) check_return_route ;;
-        10) manage_ufw ;;
-        11) manage_reality ;;
-        12) manage_forward ;;
-        13) manage_warp ;;
-        14) manage_service ;;
-        15) uninstall_all ;;
+        10) check_media_unlock ;;
+        11) manage_ufw ;;
+        12) manage_reality ;;
+        13) manage_forward ;;
+        14) manage_warp ;;
+        15) manage_service ;;
+        16) uninstall_all ;;
         0)
             printf '\n%b感谢使用，再见！%b\n\n' "$GREEN" "$NC"
             exit 0
             ;;
         *)
-            printf '\n%b[!] 选项无效，请输入 0-15 之间的数字。%b\n' "$RED" "$NC"
+            printf '\n%b[!] 选项无效，请输入 0-16 之间的数字。%b\n' "$RED" "$NC"
             sleep 1
             ;;
     esac

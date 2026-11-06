@@ -37,7 +37,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/sbx
 - **Swap 虚拟内存管理**：查看 Swap 状态，一键分配 1G / 2G / 4G / 自定义大小并写入 `/etc/fstab` 保证开机自启；支持一键彻底停用与清除。
 - **DNS 优化与修改**：预置国际公共 DNS（1.1.1.1 / 8.8.8.8）、国内主流 DNS（223.5.5.5 / 119.29.29.29）、自定义输入与一键还原原始备份。
 - **TCP 调优与 BBR 加速**：一键开启原生 BBR + FQ 拥塞控制；一键应用网络高吞吐调优参数（独立 sysctl 配置文件），支持随时一键还原默认值。
-- **回程线路测试**：测试国内三大运营商核心骨干网（电信 163/CN2、联通 169/9929、移动 CMI、教育网）的平均延迟与丢包率。
+- **回程线路测试**：集成 BestTrace 官方旗舰脚本（`wget -qO- https://besttrace.sh | bash`），全面测试电信 163/CN2、联通 169/9929、移动 CMI/CMIN2 与教育网等骨干网回程路由。
+- **流媒体与 IP 质量检测**：集成权威第三方检测引擎（`Check.Place`），一键测试各大流媒体平台（Netflix、Disney+、YouTube、TikTok、ChatGPT）解锁与 IP 纯净度。
 - **UFW 防火墙管理**：防火墙状态查看、开启/关闭、放行指定端口、删除规则；开启时自动识别当前 SSH 监听端口并放行，杜绝失联。
 
 ### 3. Sing-box 代理管理

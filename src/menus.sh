@@ -41,21 +41,21 @@ show_main_menu() {
 
     printf '\n  %b[ 网络优化与安全 ]%b\n' "$CYAN$BOLD" "$NC"
     menu_pair 6 "Swap 虚拟内存" 7 "DNS 优化与修改"
-    menu_pair 8 "TCP 调优与 BBR" 9 "回程线路测试"
-    menu_single 10 "UFW 防火墙端口管理"
+    menu_pair 8 "TCP 调优与 BBR" 9 "BestTrace 回程测试"
+    menu_pair 10 "流媒体与 IP 质量" 11 "UFW 防火墙端口管理"
 
     printf '\n  %b[ Sing-box 代理 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_pair 11 "VLESS-Reality 节点" 12 "TCP/UDP 端口转发"
-    menu_pair 13 "WARP 出口与分流" 14 "核心与服务维护"
+    menu_pair 12 "VLESS-Reality 节点" 13 "TCP/UDP 端口转发"
+    menu_pair 14 "WARP 出口与分流" 15 "核心与服务维护"
 
     printf '\n  %b[ 脚本管理 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_single 15 "彻底卸载 SBX (清除全部配置与残留)"
+    menu_single 16 "彻底卸载 SBX (清除全部配置与残留)"
 
     printf '\n'
     print_divider
     printf "  %b 0.%b 退出脚本\n\n" "$YELLOW" "$NC"
 
-    _read_menu_choice MAIN_OPT "> 请选择操作 [0-15]: "
+    _read_menu_choice MAIN_OPT "> 请选择操作 [0-16]: "
     case "$MAIN_OPT" in
         1) system_overview ;;
         2) system_update ;;
@@ -66,18 +66,19 @@ show_main_menu() {
         7) optimize_dns ;;
         8) manage_tcp_bbr ;;
         9) check_return_route ;;
-        10) manage_ufw ;;
-        11) manage_reality ;;
-        12) manage_forward ;;
-        13) manage_warp ;;
-        14) manage_service ;;
-        15) uninstall_all ;;
+        10) check_media_unlock ;;
+        11) manage_ufw ;;
+        12) manage_reality ;;
+        13) manage_forward ;;
+        14) manage_warp ;;
+        15) manage_service ;;
+        16) uninstall_all ;;
         0)
             printf '\n%b感谢使用，再见！%b\n\n' "$GREEN" "$NC"
             exit 0
             ;;
         *)
-            printf '\n%b[!] 选项无效，请输入 0-15 之间的数字。%b\n' "$RED" "$NC"
+            printf '\n%b[!] 选项无效，请输入 0-16 之间的数字。%b\n' "$RED" "$NC"
             sleep 1
             ;;
     esac
