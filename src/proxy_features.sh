@@ -110,7 +110,7 @@ manage_forward() {
 # ---------- Cloudflare WARP 出口与分流 ----------
 _has_warp_outbound() {
     [ -f "$CONFIG_FILE" ] || return 1
-    jq -e '.outbounds[] | select(.tag == "warp-out")' "$CONFIG_FILE" >/dev/null 2>&1
+    jq -e '((.endpoints[]? | select(.tag == "warp-out")) or (.outbounds[]? | select(.tag == "warp-out")))' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 manage_warp() {
@@ -139,33 +139,78 @@ manage_warp() {
                 install_singbox_bin || continue
                 deploy_sbx_service
 
-                printf '\n%b>>> 正在获取 Cloudflare WARP 免费注册凭据...%b\n' "$CYAN" "$NC"
-                # 利用 wgcf-like 或 cloudflare api 生成 wireguard 对
-                # 若失败，则使用预置公共 endpoint 引导
-                local priv_key pub_key
-                priv_key=$("$BIN_FILE" generate wireguard-keypair 2>/dev/null | awk '/PrivateKey:/{print $2}' || openssl rand -base64 32)
-                pub_key="bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+                printf '\n%b>>> 正在向 Cloudflare WARP 官方 API 注册设备与密钥...%b\n' "$CYAN" "$NC"
+                local wg_keys priv_key pub_key
+                wg_keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null)
+                priv_key=$(echo "$wg_keys" | awk '/PrivateKey:/{print $2}' | tr -d '\r')
+                pub_key=$(echo "$wg_keys" | awk '/PublicKey:/{print $2}' | tr -d '\r')
+
+                if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+                    printf '%b[!] 生成 WireGuard 密钥对失败，请检查 sing-box 核心。%b\n' "$RED" "$NC"
+                    pause_for_enter; continue;
+                fi
+
+                local install_id
+                install_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || openssl rand -hex 16)
+                local reg_payload reg_res
+                reg_payload=$(jq -n --arg key "$pub_key" --arg iid "$install_id" \
+                  '{key: $key, install_id: $iid, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $iid, locale: "en_US"}')
+
+                reg_res=$(curl -s -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
+                  -H "User-Agent: okhttp/3.12.1" \
+                  -H "CF-Client-Version: a-6.3-2158" \
+                  -H "Content-Type: application/json" \
+                  -d "$reg_payload" --connect-timeout 10 2>/dev/null)
+
+                local v4_addr v6_addr peer_pub peer_ip
+                v4_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v4 // empty')
+                v6_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v6 // empty')
+                peer_pub=$(echo "$reg_res" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
+                peer_ip="162.159.192.8"
+
+                [ -n "$v4_addr" ] || v4_addr="172.16.0.2"
+
+                local addr_arr
+                if [ -n "$v6_addr" ]; then
+                    addr_arr="[\"${v4_addr}/32\", \"${v6_addr}/128\"]"
+                else
+                    addr_arr="[\"${v4_addr}/32\"]"
+                fi
+
+                local warp_endpoint
+                warp_endpoint=$(jq -n \
+                  --arg priv "$priv_key" \
+                  --arg pub "$peer_pub" \
+                  --arg pip "$peer_ip" \
+                  --argjson addrs "$addr_arr" \
+                  '{
+                    "type": "wireguard",
+                    "tag": "warp-out",
+                    "address": $addrs,
+                    "private_key": $priv,
+                    "peers": [
+                      {
+                        "address": $pip,
+                        "port": 2408,
+                        "public_key": $pub,
+                        "allowed_ips": ["0.0.0.0/0", "::/0"]
+                      }
+                    ]
+                  }')
 
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_warp_XXXXXX)
-                jq --arg priv "$priv_key" \
-                   --arg pub "$pub_key" \
-                   '.outbounds = [.outbounds[] | select(.tag != "warp-out")] + [{
-                      "type": "wireguard",
-                      "tag": "warp-out",
-                      "server": "162.159.193.10",
-                      "server_port": 2408,
-                      "local_address": ["172.16.0.2/32"],
-                      "private_key": $priv,
-                      "peer_public_key": $pub
-                   }]' "$CONFIG_FILE" > "$tmp_c"
+                jq --argjson ep "$warp_endpoint" '
+                  .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + [$ep]) |
+                  .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
+                ' "$CONFIG_FILE" > "$tmp_c"
 
                 if ! sbx_apply_config_safe "$tmp_c"; then
                     pause_for_enter
                     continue
                 fi
 
-                printf '\n%b[成功] WARP WireGuard 出口已注入并生效！%b\n' "$GREEN" "$NC"
+                printf '\n%b[成功] Cloudflare WARP 官方设备注册成功，WireGuard 端点已接入！%b\n' "$GREEN" "$NC"
                 pause_for_enter
                 ;;
             2)
@@ -176,6 +221,7 @@ manage_warp() {
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
                 jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or (.domain_suffix? // []) != ["openai.com", "chatgpt.com", "ai.com"])] + [{
+                      "action": "route",
                       "domain_suffix": ["openai.com", "chatgpt.com", "ai.com", "oaistatic.com", "oaiusercontent.com"],
                       "outbound": "warp-out"
                    }]' "$CONFIG_FILE" > "$tmp_c"
@@ -194,6 +240,7 @@ manage_warp() {
                 local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
                 jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or (.domain_suffix? // []) != ["netflix.com", "disneyplus.com"])] + [{
+                      "action": "route",
                       "domain_suffix": ["netflix.com", "nflxvideo.net", "disneyplus.com", "bamgrid.com"],
                       "outbound": "warp-out"
                    }]' "$CONFIG_FILE" > "$tmp_c"
@@ -209,7 +256,8 @@ manage_warp() {
                     acquire_lock || continue
                     local tmp_c
                     tmp_c=$(mktemp /tmp/sbx_warp_del_XXXXXX)
-                    jq '.outbounds = [.outbounds[] | select(.tag != "warp-out")] |
+                    jq '.endpoints = [.endpoints[]? | select(.tag != "warp-out")] |
+                        .outbounds = [.outbounds[]? | select(.tag != "warp-out")] |
                         .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]' "$CONFIG_FILE" > "$tmp_c"
                     if ! sbx_apply_config_safe "$tmp_c"; then
                         pause_for_enter
