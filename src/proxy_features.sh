@@ -243,11 +243,12 @@ _test_warp_connectivity() {
 }
 
 _warp_registration_endpoint() {
+    # Leave room for WireGuard encapsulation to avoid sendmmsg: message too long.
     jq -ce --rawfile priv /dev/fd/3 '
       .config.interface.addresses as $addr | .config.peers[0].public_key as $peer |
       select(($addr.v4 | strings | test("^[0-9]+(\\.[0-9]+){3}$")) and
         ($peer | strings | test("^[A-Za-z0-9+/]{43}=$"))) |
-      {type: "wireguard", tag: "warp-out", private_key: ($priv | rtrimstr("\n")),
+      {type: "wireguard", tag: "warp-out", mtu: 1280, private_key: ($priv | rtrimstr("\n")),
         address: ([$addr.v4 + "/32"] + (if ($addr.v6 // "") == "" then [] else [$addr.v6 + "/128"] end)),
         peers: [{address: "162.159.192.8", port: 2408, public_key: $peer, allowed_ips: ["0.0.0.0/0", "::/0"]}]}
     ' 3<<< "$1"

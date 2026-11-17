@@ -39,6 +39,7 @@ class TestWarp(unittest.TestCase):
         endpoint = json.loads(result.stdout)
         self.assertEqual(endpoint["address"], ["172.16.0.2/32", "2606:4700::2/128"])
         self.assertEqual(endpoint["private_key"], "sample-key")
+        self.assertEqual(endpoint["mtu"], 1280)
 
     def test_sync_keeps_other_rules_and_skips_deleted_nodes(self):
         ai = {"outbound": "warp-out", "rule_set": "geosite-ai"}
