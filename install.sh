@@ -1,40 +1,39 @@
 #!/usr/bin/env bash
-# =====================================================================
-# SBX 面板一键安装脚本
-# 项目地址: https://github.com/3922510-creator/sbx
-# =====================================================================
 set -euo pipefail
 
-SBX_INSTALL_DIR="/usr/local/bin"
-SBX_BIN="${SBX_INSTALL_DIR}/sbx"
-REMOTE_RAW_URL="${SBX_RAW_URL:-https://raw.githubusercontent.com/3922510-creator/sbx/main/sbx.sh}"
-
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-    echo "[!] 请以 root 用户权限运行此安装器。" >&2
+mode=${1:-install}
+if [[ $# -gt 1 || ( "$mode" != install && "$mode" != --run ) ]]; then
+    echo '用法: bash install.sh [--run]' >&2
+    exit 2
+fi
+if (( EUID != 0 )); then
+    echo '[!] 请以 root 用户权限运行。' >&2
     exit 1
 fi
 
-mkdir -p "$SBX_INSTALL_DIR"
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+tmp_dir=$(mktemp -d)
+stage=''
+trap 'rm -rf -- "$tmp_dir"; if [[ -n "$stage" ]]; then rm -f -- "$stage"; fi' EXIT
 
-# 优先使用本地同目录的 sbx.sh，若没有则从 GitHub 下载
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
-if [ -f "${SCRIPT_DIR}/sbx.sh" ]; then
-    install -m 755 "${SCRIPT_DIR}/sbx.sh" "$SBX_BIN"
-    echo "[成功] 已从本地文件安装 sbx 至 ${SBX_BIN}"
-else
-    echo ">>> 正在从 GitHub 获取最新版本..."
-    tmp_file=$(mktemp /tmp/sbx_install_XXXXXX)
-    if curl -fsSL --connect-timeout 8 --max-time 30 "$REMOTE_RAW_URL" -o "$tmp_file"; then
-        install -m 755 "$tmp_file" "$SBX_BIN"
-        rm -f "$tmp_file"
-        echo "[成功] 已安装最新版 sbx 至 ${SBX_BIN}"
-    else
-        rm -f "$tmp_file"
-        echo "[错误] 从远程下载 sbx 失败，请检查网络连接。" >&2
-        exit 1
-    fi
+# 拉取同一份源码快照，避免逐个文件下载时跨越两次提交。
+if [[ ! -f "$source_dir/tools/build.sh" ]]; then
+    curl -qfsSL --connect-timeout 8 --max-time 60 \
+        https://codeload.github.com/3922510-creator/sbx/tar.gz/refs/heads/main \
+        -o "$tmp_dir/source.tar.gz"
+    mkdir "$tmp_dir/source"
+    tar -xzf "$tmp_dir/source.tar.gz" --strip-components=1 -C "$tmp_dir/source"
+    source_dir="$tmp_dir/source"
 fi
+bash "$source_dir/tools/build.sh" "$tmp_dir/sbx"
 
-echo "================================================="
-echo " 安装成功！直接在终端输入 sbx 即可唤起管理面板。"
-echo "================================================="
+if [[ "$mode" == --run ]]; then
+    bash "$tmp_dir/sbx"
+else
+    mkdir -p /usr/local/bin
+    stage=$(mktemp /usr/local/bin/.sbx.XXXXXX)
+    install -m 755 "$tmp_dir/sbx" "$stage"
+    mv -fT -- "$stage" /usr/local/bin/sbx
+    stage=''
+    echo '[成功] 已安装到 /usr/local/bin/sbx，输入 sbx 打开面板。'
+fi

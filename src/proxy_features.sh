@@ -64,9 +64,19 @@ manage_forward() {
 }
 
 # ---------- Cloudflare WARP 出口与分流 ----------
-_has_warp_outbound() {
-    [ -f "$CONFIG_FILE" ] || return 1
-    jq -e '((.endpoints[]? | select(.tag == "warp-out")) or (.outbounds[]? | select(.tag == "warp-out")))' "$CONFIG_FILE" >/dev/null 2>&1
+_warp_entry() {
+    jq -ec 'first(
+      (.endpoints[]? | select(.tag == "warp-out") | {endpoints: [.]}),
+      (.outbounds[]? | select(.tag == "warp-out") | {outbounds: [.]})
+    )' "$CONFIG_FILE" 2>/dev/null
+}
+
+_has_warp_outbound() { _warp_entry >/dev/null; }
+
+_show_warp_addresses() {
+    local addresses
+    addresses=$(_warp_entry | jq -r '(.endpoints[0].address // .outbounds[0].local_address // []) | if type == "array" then join(" · ") else . end')
+    printf '  %b隧道地址（非公网 IP）:%b %s\n' "$CYAN" "$NC" "${addresses:-未配置}"
 }
 
 _is_warp_global() {
@@ -94,37 +104,30 @@ _get_warp_nodes() {
     jq -r '.warp_nodes[]? // empty' "$STATE_FILE" 2>/dev/null
 }
 
-_sync_warp_custom_rules() {
-    local cfg_in="$1" cfg_out="$2" doms_json
-    doms_json=$(jq -c '.warp_custom_domains // []' "$STATE_FILE" 2>/dev/null || echo "[]")
-    if [ "$doms_json" = "[]" ] || [ -z "$doms_json" ]; then
-        jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .rule_set != null or .inbound != null)]' "$cfg_in" > "$cfg_out"
-    else
-        jq --argjson doms "$doms_json" '
-          .route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .rule_set != null or .inbound != null)] + [{
-            "action": "route", "domain_suffix": $doms, "outbound": "warp-out"
-          }]
-        ' "$cfg_in" > "$cfg_out"
-    fi
+_sync_warp_rules() {
+    jq --slurpfile state "$2" '
+      ($state[0] | [.warp_nodes[]? as $t | select(.nodes[$t] != null) | $t]) as $nodes |
+      ($state[0].warp_custom_domains // []) as $domains |
+      .route.rules |= (
+        map(select(.outbound != "warp-out" or (.inbound == null and .domain_suffix == null))) |
+        (if ($nodes | length) > 0 and (any(.[]; .ip_is_private == true) | not) then
+          [{action: "route", ip_is_private: true, outbound: "direct"}] + . else . end) +
+        (if ($domains | length) > 0 then [{action: "route", domain_suffix: $domains, outbound: "warp-out"}] else [] end) +
+        (if ($nodes | length) > 0 then [{action: "route", inbound: $nodes, outbound: "warp-out"}] else [] end)
+      )
+    ' "$1"
 }
 
-_sync_warp_node_rules() {
-    local cfg_in="$1" cfg_out="$2" nodes_json
-    nodes_json=$(jq -c '[.warp_nodes[]? as $t | select(.nodes[$t] != null) | $t]' "$STATE_FILE" 2>/dev/null || echo "[]")
-    if [ "$nodes_json" = "[]" ] || [ -z "$nodes_json" ]; then
-        jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .inbound == null)]' "$cfg_in" > "$cfg_out"
-    else
-        jq --argjson ibs "$nodes_json" '
-          .route.rules = (
-            (if ([.route.rules[]? | select(.ip_is_private == true)] | length) == 0 then
-              [{ "action": "route", "ip_is_private": true, "outbound": "direct" }]
-            else [] end) +
-            [.route.rules[]? | select(.outbound != "warp-out" or .inbound == null)] +
-            [{ "action": "route", "inbound": $ibs, "outbound": "warp-out" }]
-          )
-        ' "$cfg_in" > "$cfg_out"
-    fi
-}
+_warp_edit_state() (
+    acquire_lock || exit 1
+    local state config
+    state=$(mktemp "${STATE_FILE}.XXXXXX") || exit 1
+    trap 'rm -f "$state" "${config:-}"' EXIT
+    config=$(mktemp "${CONFIG_FILE}.XXXXXX") || exit 1
+    jq "$@" "$STATE_FILE" > "$state" &&
+        _sync_warp_rules "$CONFIG_FILE" "$state" > "$config" &&
+        sbx_apply_config_safe "$config" "$state"
+)
 
 _manage_warp_nodes() {
     if ! _has_warp_outbound; then
@@ -154,39 +157,15 @@ _manage_warp_nodes() {
         print_divider
         printf "  %b输入节点序号切换状态  |  a 全部开启  |  c 全部取消  |  0 返回%b\n" "$DIM" "$NC"
         _read_menu_choice wn_opt "> 选择: "
-        local tmp_s tmp_c
         case "$wn_opt" in
             0|'') return 0 ;;
-            a|A)
-                acquire_lock || continue
-                tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                jq '.warp_nodes = (.nodes | keys)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
-                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 所有节点已绑定走 WARP%b\n' "$GREEN" "$NC"
-                sleep 0.6 ;;
-            c|C)
-                acquire_lock || continue
-                tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                jq '.warp_nodes = []' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
-                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已取消所有节点的 WARP 绑定%b\n' "$GREEN" "$NC"
-                sleep 0.6 ;;
+            a|A) _warp_edit_state '.warp_nodes = (.nodes | keys)' || pause_for_enter ;;
+            c|C) _warp_edit_state '.warp_nodes = []' || pause_for_enter ;;
             *)
-                if [[ "$wn_opt" =~ ^[0-9]+$ ]] && [ "$wn_opt" -ge 1 ] && [ "$wn_opt" -le "${#tags[@]}" ]; then
-                    local sel_tag="${tags[$((wn_opt - 1))]}" sel_name
-                    sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
-                    acquire_lock || continue
-                    tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                    if _is_node_warp "$sel_tag"; then
-                        jq --arg t "$sel_tag" '.warp_nodes = ([.warp_nodes[]? | select(. != $t)])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
-                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 节点 [%s] 已恢复默认出站%b\n' "$GREEN" "$sel_name" "$NC"
-                    else
-                        jq --arg t "$sel_tag" '.warp_nodes = (((.warp_nodes // []) + [$t]) | unique)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
-                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 节点 [%s] 已指定走 WARP%b\n' "$GREEN" "$sel_name" "$NC"
-                    fi
-                    sleep 0.6
+                if [[ "$wn_opt" =~ ^[1-9][0-9]*$ ]] && [ "$wn_opt" -le "${#tags[@]}" ]; then
+                    _warp_edit_state --arg t "${tags[$((wn_opt - 1))]}" '
+                      .warp_nodes |= ((. // []) | if index($t) != null then map(select(. != $t)) else . + [$t] end)
+                    ' || pause_for_enter
                 fi ;;
         esac
     done
@@ -207,6 +186,7 @@ _show_warp_rules_detail() {
     done < <(_get_warp_nodes)
 
     printf "  %b端点状态:%b %b  |  %b出站模式:%b %b\n" "$CYAN" "$NC" "$ep_st" "$CYAN" "$NC" "$mode_st"
+    _show_warp_addresses
     print_divider
     printf "  1. %b指定节点分流:%b %s\n" "$BOLD" "$NC" "${w_nodes[*]:-无}"
     printf "  2. %bAI 智能分流 :%b %b\n" "$BOLD" "$NC" "$ai_st"
@@ -216,34 +196,88 @@ _show_warp_rules_detail() {
     pause_for_enter
 }
 
+_probe_warp() (
+    umask 077
+    local dir pid port attempt trace ip colo flag
+    dir=$(mktemp -d /tmp/sbx_warp_probe_XXXXXX) || exit 1
+    trap 'if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fi; rm -rf "$dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+    _warp_entry | jq -e '. + {
+      log: {level: "info"},
+      inbounds: [{type: "mixed", tag: "warp-probe", listen: "127.0.0.1", listen_port: 0}],
+      route: {final: "warp-out"}
+    }' > "$dir/config.json" || exit 1
+    "$BIN_FILE" --disable-color run -c "$dir/config.json" > "$dir/log" 2>&1 &
+    pid=$!
+    for ((attempt=0; attempt<30; attempt++)); do
+        kill -0 "$pid" 2>/dev/null || break
+        port=$(sed -nE 's/^.*inbound\/mixed\[warp-probe\]: tcp server started at 127\.0\.0\.1:([0-9]+).*$/\1/p' "$dir/log")
+        if [ -n "$port" ] && grep -q 'sing-box started' "$dir/log"; then break; fi
+        sleep 0.1
+    done
+    if [ -z "$port" ] || ! kill -0 "$pid" 2>/dev/null || ! grep -q 'sing-box started' "$dir/log"; then
+        printf '%b[!] WARP 测试进程启动失败，请检查核心版本与端点配置%b\n' "$RED" "$NC" >&2
+        exit 1
+    fi
+    trace=$(curl -qfsS --noproxy '' --proxy "socks5h://127.0.0.1:$port" --connect-timeout 5 --max-time 12 \
+      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || {
+        printf '%b[!] 无法通过 WARP 访问 Cloudflare Trace%b\n' "$RED" "$NC" >&2; exit 1;
+    }
+    ip=$(awk -F= '/^ip=/{print $2; exit}' <<< "$trace")
+    colo=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
+    flag=$(awk -F= '/^warp=/{print $2; exit}' <<< "$trace")
+    if [[ ! "$ip" =~ ^[0-9A-Fa-f:.]+$ || ! "$colo" =~ ^[A-Z]{3}$ || ! "$flag" =~ ^(on|plus)$ ]]; then
+        printf '%b[!] Trace 未确认流量经过 WARP，不显示为成功%b\n' "$RED" "$NC" >&2
+        exit 1
+    fi
+    printf '%s  |  Cloudflare: %s  |  WARP: %s\n' "$ip" "$colo" "$flag"
+)
+
 _test_warp_connectivity() {
-    printf '\n%b>>> 测试 WARP 连通性...%b\n' "$CYAN" "$NC"
-    _has_warp_outbound || { printf '%b[!] 请先接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; return 1; }
-    local ep_json test_port=15891 tmp_test test_pid trace_res ip colo warp_flag
-    ep_json=$(jq -c '.endpoints[]? | select(.tag == "warp-out")' "$CONFIG_FILE" 2>/dev/null)
-    [ -n "$ep_json" ] || { printf '%b[!] 未找到 warp-out 端点%b\n' "$RED" "$NC"; pause_for_enter; return 1; }
-
-    tmp_test=$(mktemp /tmp/sbx_test_warp_XXXXXX.json)
-    jq -n --argjson ep "$ep_json" --argjson port "$test_port" '{
-      "log": { "level": "warn" }, "endpoints": [$ep],
-      "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $port }],
-      "outbounds": [{ "type": "direct", "tag": "direct" }],
-      "route": { "rules": [{ "outbound": "warp-out" }] }
-    }' > "$tmp_test"
-
-    "$BIN_FILE" run -c "$tmp_test" >/dev/null 2>&1 &
-    test_pid=$!; sleep 1.6
-    trace_res=$(curl -x "socks5h://127.0.0.1:${test_port}" -s --connect-timeout 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-    kill "$test_pid" 2>/dev/null || true; rm -f "$tmp_test"
-
-    [ -n "$trace_res" ] || { printf '%b[!] WARP 连接超时%b\n' "$RED" "$NC"; pause_for_enter; return 1; }
-    ip=$(echo "$trace_res" | awk -F= '/^ip=/{print $2}')
-    colo=$(echo "$trace_res" | awk -F= '/^colo=/{print $2}')
-    warp_flag=$(echo "$trace_res" | awk -F= '/^warp=/{print $2}')
-    printf "  %b状态:%b %b连通%b  |  %bIP:%b %s  |  %b节点:%b %s  |  %bWARP:%b %s\n" \
-        "$CYAN" "$NC" "$GREEN" "$NC" "$CYAN" "$NC" "${ip:-未知}" "$CYAN" "$NC" "${colo:-未知}" "$CYAN" "$NC" "${warp_flag:-未知}"
-    pause_for_enter
+    _show_warp_addresses
+    warp_exit_ip=""
+    _has_warp_outbound || { printf '%b[!] 请先接入 WARP%b\n' "$YELLOW" "$NC"; return 1; }
+    printf '%b>>> 正在检测 WARP 公网出口…%b\n' "$CYAN" "$NC"
+    warp_exit_ip=$(_probe_warp) || return 1
+    printf '  %b公网出口 IP:%b %s\n' "$GREEN" "$NC" "$warp_exit_ip"
 }
+
+_warp_registration_endpoint() {
+    jq -ce --rawfile priv /dev/fd/3 '
+      .config.interface.addresses as $addr | .config.peers[0].public_key as $peer |
+      select(($addr.v4 | strings | test("^[0-9]+(\\.[0-9]+){3}$")) and
+        ($peer | strings | test("^[A-Za-z0-9+/]{43}=$"))) |
+      {type: "wireguard", tag: "warp-out", private_key: ($priv | rtrimstr("\n")),
+        address: ([$addr.v4 + "/32"] + (if ($addr.v6 // "") == "" then [] else [$addr.v6 + "/128"] end)),
+        peers: [{address: "162.159.192.8", port: 2408, public_key: $peer, allowed_ips: ["0.0.0.0/0", "::/0"]}]}
+    ' 3<<< "$1"
+}
+
+_register_warp() (
+    local keys priv pub id payload response endpoint candidate
+    keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null) || exit 1
+    read -r priv pub < <(awk '/^PrivateKey:/{p=$2} /^PublicKey:/{q=$2} END{print p, q}' <<< "$keys")
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        printf '%b[!] 生成 WireGuard 密钥失败%b\n' "$RED" "$NC"
+        exit 1
+    fi
+    read -r id < /proc/sys/kernel/random/uuid || exit 1
+    payload=$(jq -nc --arg key "$pub" --arg id "${id//-/}" '
+      {key: $key, install_id: $id, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $id, locale: "en_US"}
+    ') || exit 1
+    if ! response=$(curl -qfsS --connect-timeout 8 --max-time 20 https://api.cloudflareclient.com/v0a2158/reg \
+      -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' --data "$payload") ||
+       ! endpoint=$(_warp_registration_endpoint "$priv" <<< "$response" 2>/dev/null); then
+        printf '%b[!] WARP 注册失败或返回缺少地址/公钥，原配置未改动%b\n' "$RED" "$NC"
+        exit 1
+    fi
+    candidate=$(mktemp "${CONFIG_FILE}.XXXXXX") || exit 1
+    trap 'rm -f "$candidate"' EXIT
+    jq --slurpfile ep /dev/fd/3 '
+      .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + $ep) |
+      .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
+    ' 3<<< "$endpoint" "$CONFIG_FILE" > "$candidate" && sbx_apply_config_safe "$candidate"
+)
 
 _toggle_geosite_rule() {
     local r_tag="$1" r_name="$2" r_file="$3"
@@ -272,6 +306,7 @@ _toggle_geosite_rule() {
 }
 
 manage_warp() {
+    local warp_exit_ip=""
     while true; do
         menu_header "Cloudflare WARP 出口与分流"
         init_sbx_config
@@ -284,11 +319,15 @@ manage_warp() {
         node_cnt=$(jq '[.warp_nodes[]? as $t | select(.nodes[$t] != null)] | length' "$STATE_FILE" 2>/dev/null || echo 0)
 
         printf "  %bWARP:%b %b  |  %b模式:%b %b\n" "$CYAN" "$NC" "$warp_st" "$CYAN" "$NC" "$mode_st"
+        if _has_warp_outbound; then
+            _show_warp_addresses
+            printf '  %b公网出口 IP:%b %s\n' "$CYAN" "$NC" "${warp_exit_ip:-未检测，选 3 查询}"
+        fi
         printf "  %b分流:%b 节点[%b%s%b] · AI[%b] · 流媒体[%b] · 域名[%b%s%b]\n\n" \
             "$CYAN" "$NC" "$YELLOW" "$node_cnt" "$NC" "$ai_tag" "$stream_tag" "$CYAN" "$dom_cnt" "$NC"
 
         menu_pair 1 "接入/重置 WARP" 2 "查看规则详情"
-        menu_pair 3 "测试 WARP 连通" 4 "全局 WARP 开关"
+        menu_pair 3 "查询 WARP 公网 IP" 4 "全局 WARP 开关"
         print_divider
         menu_pair 5 "指定节点走 WARP" 6 "AI 分流开关"
         menu_pair 7 "流媒体分流开关" 8 "添加分流域名"
@@ -302,37 +341,13 @@ manage_warp() {
                 install_singbox_bin || continue
                 deploy_sbx_service
                 printf '\n%b>>> 注册 Cloudflare WARP...%b\n' "$CYAN" "$NC"
-                local wg_keys priv_key pub_key install_id reg_payload reg_res v4_addr v6_addr peer_pub addr_arr warp_endpoint tmp_c
-                wg_keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null)
-                priv_key=$(echo "$wg_keys" | awk '/PrivateKey:/{print $2}' | tr -d '\r')
-                pub_key=$(echo "$wg_keys" | awk '/PublicKey:/{print $2}' | tr -d '\r')
-                [ -n "$priv_key" ] && [ -n "$pub_key" ] || { printf '%b[!] 生成密钥失败%b\n' "$RED" "$NC"; pause_for_enter; continue; }
-
-                install_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || openssl rand -hex 16)
-                reg_payload=$(jq -n --arg key "$pub_key" --arg iid "$install_id" \
-                  '{key: $key, install_id: $iid, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $iid, locale: "en_US"}')
-                reg_res=$(curl -s -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-                  -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.3-2158" -H "Content-Type: application/json" \
-                  -d "$reg_payload" --connect-timeout 10 2>/dev/null)
-
-                v4_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v4 // "172.16.0.2"')
-                v6_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v6 // empty')
-                peer_pub=$(echo "$reg_res" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
-                [ -n "$v6_addr" ] && addr_arr="[\"${v4_addr}/32\", \"${v6_addr}/128\"]" || addr_arr="[\"${v4_addr}/32\"]"
-
-                warp_endpoint=$(jq -n --arg priv "$priv_key" --arg pub "$peer_pub" --argjson addrs "$addr_arr" '{
-                  "type": "wireguard", "tag": "warp-out", "address": $addrs, "private_key": $priv,
-                  "peers": [{ "address": "162.159.192.8", "port": 2408, "public_key": $pub, "allowed_ips": ["0.0.0.0/0", "::/0"] }]
-                }')
-                tmp_c=$(mktemp /tmp/sbx_warp_XXXXXX)
-                jq --argjson ep "$warp_endpoint" '
-                  .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + [$ep]) |
-                  .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
-                ' "$CONFIG_FILE" > "$tmp_c"
-                sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] WARP 端点已就绪 (%s)%b\n' "$GREEN" "$v4_addr" "$NC"
+                if _register_warp; then
+                    printf '\n%b[OK] WARP 端点已就绪%b\n' "$GREEN" "$NC"
+                    _test_warp_connectivity
+                fi
                 pause_for_enter ;;
             2) _show_warp_rules_detail ;;
-            3) _test_warp_connectivity ;;
+            3) _test_warp_connectivity; pause_for_enter ;;
             4)
                 _has_warp_outbound || { printf '\n%b[!] 请先选 1 接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
                 acquire_lock || continue
@@ -358,24 +373,22 @@ manage_warp() {
             7) _toggle_geosite_rule "geosite-stream" "流媒体分流" "geosite-category-entertainment@!cn.srs" ;;
             8)
                 _has_warp_outbound || { printf '\n%b[!] 请先选 1 接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
-                local raw_doms new_doms=() d tmp_s tmp_c json_arr
+                local raw_doms new_doms=() parts=() d json_arr
                 read -rp "  输入分流域名 (空格分隔, 如 claude.ai reddit.com): " raw_doms
                 raw_doms=$(echo "$raw_doms" | tr -d '\r')
                 [ -n "$raw_doms" ] || continue
-                for d in $raw_doms; do
+                read -r -a parts <<< "$raw_doms"
+                for d in "${parts[@]}"; do
                     d=$(echo "$d" | tr '[:upper:]' '[:lower:]' | sed -E 's|^https?://||; s|/.*$||')
                     [[ "$d" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] && new_doms+=("$d")
                 done
                 [ "${#new_doms[@]}" -gt 0 ] || { printf '%b[!] 域名格式无效%b\n' "$RED" "$NC"; pause_for_enter; continue; }
-                acquire_lock || continue
-                tmp_s=$(mktemp /tmp/sbx_state_XXXXXX); tmp_c=$(mktemp /tmp/sbx_cfg_XXXXXX)
-                json_arr=$(printf '%s\n' "${new_doms[@]}" | jq -R . | jq -s .)
-                jq --argjson new "$json_arr" '.warp_custom_domains = ((.warp_custom_domains // []) + $new | unique)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已添加: %s%b\n' "$GREEN" "${new_doms[*]}" "$NC"
+                json_arr=$(printf '%s\n' "${new_doms[@]}" | jq -Rn '[inputs]')
+                _warp_edit_state --argjson new "$json_arr" '.warp_custom_domains |= ((. // []) + $new | unique)' &&
+                    printf '%b[OK] 已添加: %s%b\n' "$GREEN" "${new_doms[*]}" "$NC"
                 pause_for_enter ;;
             9)
-                local cur_doms=() d idx=1 del_choice tmp_s tmp_c
+                local cur_doms=() d idx=1 del_choice
                 while IFS= read -r d; do [ -n "$d" ] && cur_doms+=("$d"); done < <(_get_warp_custom_domains)
                 [ "${#cur_doms[@]}" -gt 0 ] || { printf '\n%b[!] 暂无自定义域名%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
                 printf '\n'
@@ -385,20 +398,13 @@ manage_warp() {
                     0|'') continue ;;
                     a|A)
                         confirm_action "清空所有自定义分流域名？" || continue
-                        acquire_lock || continue
-                        tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                        jq '.warp_custom_domains = []' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已清空%b\n' "$GREEN" "$NC"
+                        _warp_edit_state '.warp_custom_domains = []' && printf '%b[OK] 已清空%b\n' "$GREEN" "$NC"
                         pause_for_enter ;;
                     *)
-                        if [[ "$del_choice" =~ ^[0-9]+$ ]] && [ "$del_choice" -ge 1 ] && [ "$del_choice" -le "${#cur_doms[@]}" ]; then
+                        if [[ "$del_choice" =~ ^[1-9][0-9]*$ ]] && [ "$del_choice" -le "${#cur_doms[@]}" ]; then
                             local target_dom="${cur_doms[$((del_choice - 1))]}"
-                            acquire_lock || continue
-                            tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                            jq --arg d "$target_dom" '.warp_custom_domains = [.warp_custom_domains[]? | select(. != $d)]' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                            _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                            sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已删除: %s%b\n' "$GREEN" "$target_dom" "$NC"
+                            _warp_edit_state --arg d "$target_dom" '.warp_custom_domains |= map(select(. != $d))' &&
+                                printf '%b[OK] 已删除: %s%b\n' "$GREEN" "$target_dom" "$NC"
                             pause_for_enter
                         fi ;;
                 esac ;;
@@ -406,16 +412,21 @@ manage_warp() {
                 confirm_action "彻底移除 WARP 出口及全部关联规则？" || continue
                 acquire_lock || continue
                 local tmp_c tmp_s
-                tmp_c=$(mktemp /tmp/sbx_warp_del_XXXXXX); tmp_s=$(mktemp /tmp/sbx_state_del_XXXXXX)
+                tmp_c=$(mktemp "${CONFIG_FILE}.XXXXXX") || continue
+                tmp_s=$(mktemp "${STATE_FILE}.XXXXXX") || { rm -f "$tmp_c"; continue; }
                 jq '
                   .endpoints = [.endpoints[]? | select(.tag != "warp-out")] |
                   .outbounds = [.outbounds[]? | select(.tag != "warp-out")] |
-                  .route.final = "direct" |
+                  .route.final |= (if . == "warp-out" then "direct" else . end) |
                   .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-ai" and .tag != "geosite-stream")] |
                   .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]
-                ' "$CONFIG_FILE" > "$tmp_c"
-                jq '.warp_custom_domains = [] | .warp_nodes = []' "$STATE_FILE" > "$tmp_s" 2>/dev/null && mv "$tmp_s" "$STATE_FILE"
-                sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] WARP 及分流规则已移除%b\n' "$GREEN" "$NC"
+                ' "$CONFIG_FILE" > "$tmp_c" &&
+                jq '.warp_custom_domains = [] | .warp_nodes = []' "$STATE_FILE" > "$tmp_s" &&
+                sbx_apply_config_safe "$tmp_c" "$tmp_s" && {
+                    warp_exit_ip=""
+                    printf '\n%b[OK] WARP 及分流规则已移除%b\n' "$GREEN" "$NC"
+                }
+                rm -f "$tmp_c" "$tmp_s"
                 pause_for_enter ;;
             0) return 0 ;;
         esac

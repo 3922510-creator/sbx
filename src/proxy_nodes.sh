@@ -59,7 +59,7 @@ add_reality_node() {
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "1a2b3c4d5e6f7a8b")
     tag="vless-reality-${port}"
 
-    tmp_conf=$(mktemp /tmp/sbx_conf_XXXXXX)
+    tmp_conf=$(mktemp "${CONFIG_FILE}.XXXXXX") || return 1
     jq --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg priv "$priv_key" --arg sid "$short_id" '
       .inbounds = [.inbounds[] | select(.tag != $tag)] + [{
         "type": "vless",
@@ -80,15 +80,14 @@ add_reality_node() {
         }
       }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
 
-    sbx_apply_config_safe "$tmp_conf" || { pause_for_enter; return 1; }
-
-    tmp_state=$(mktemp /tmp/sbx_state_XXXXXX)
+    tmp_state=$(mktemp "${STATE_FILE}.XXXXXX") || { rm -f "$tmp_conf"; return 1; }
     jq --arg tag "$tag" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pub "$pub_key" --arg sid "$short_id" '
       .nodes[$tag] = {
         "name": $name, "port": $port, "uuid": $uuid, "sni": $sni,
         "pub_key": $pub, "short_id": $sid, "created_at": (now | todate)
-      }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
-    rm -f "$tmp_state"
+      }' "$STATE_FILE" > "$tmp_state" && sbx_apply_config_safe "$tmp_conf" "$tmp_state" || {
+        rm -f "$tmp_conf" "$tmp_state"; pause_for_enter; return 1;
+    }
 
     printf '\n%b[OK] 节点创建成功%b\n' "$GREEN" "$NC"
     _show_node_by_tag "$tag"
@@ -186,18 +185,13 @@ manage_reality() {
                     if confirm_action "删除节点 ${sel_name}？"; then
                         acquire_lock || continue
                         local tmp_s tmp_c1 tmp_c2
-                        tmp_s=$(mktemp /tmp/sbx_s_XXXXXX)
-                        jq --arg tag "$sel_tag" 'del(.nodes[$tag]) | .warp_nodes = ([.warp_nodes[]? | select(. != $tag)])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        tmp_c1=$(mktemp /tmp/sbx_c1_XXXXXX)
-                        tmp_c2=$(mktemp /tmp/sbx_c2_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c1"
-                        if type _sync_warp_node_rules >/dev/null 2>&1; then
-                            _sync_warp_node_rules "$tmp_c1" "$tmp_c2"
-                            rm -f "$tmp_c1"
-                        else
-                            mv "$tmp_c1" "$tmp_c2"
-                        fi
-                        sbx_apply_config_safe "$tmp_c2" && printf '%b[OK] 节点已删除%b\n' "$GREEN" "$NC"
+                        tmp_s=$(mktemp "${STATE_FILE}.XXXXXX") || continue
+                        tmp_c1=$(mktemp "${CONFIG_FILE}.XXXXXX") && tmp_c2=$(mktemp "${CONFIG_FILE}.XXXXXX") &&
+                            jq --arg tag "$sel_tag" 'del(.nodes[$tag]) | .warp_nodes = [.warp_nodes[]? | select(. != $tag)]' "$STATE_FILE" > "$tmp_s" &&
+                            jq --arg tag "$sel_tag" '.inbounds |= map(select(.tag != $tag))' "$CONFIG_FILE" > "$tmp_c1" &&
+                            _sync_warp_rules "$tmp_c1" "$tmp_s" > "$tmp_c2" &&
+                            sbx_apply_config_safe "$tmp_c2" "$tmp_s" && printf '%b[OK] 节点已删除%b\n' "$GREEN" "$NC"
+                        rm -f "$tmp_s" "${tmp_c1:-}" "${tmp_c2:-}"
                         pause_for_enter
                     fi
                 fi ;;

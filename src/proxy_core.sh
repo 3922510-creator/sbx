@@ -19,7 +19,8 @@ sbx_service_status() {
 }
 
 install_singbox_bin() {
-    [ -x "$BIN_FILE" ] && return 0
+    local mode="${1:-install}"
+    if [ "$mode" != update ] && [ -x "$BIN_FILE" ]; then return 0; fi
     printf '%b>>> 安装 Sing-box 核心...%b\n' "$CYAN" "$NC"
     local arch uname_m
     uname_m=$(uname -m)
@@ -30,26 +31,28 @@ install_singbox_bin() {
         *) printf '%b[!] 不支持的架构: %s%b\n' "$RED" "$uname_m" "$NC"; return 1 ;;
     esac
 
-    local tag url tmp_dir ver
-    tag=$(curl -sL --connect-timeout 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | cut -d'"' -f4)
-    [ -n "$tag" ] || tag="v1.11.4"
+    local tag url tmp_dir ver member version rc=1
+    tag=$(curl -fsSL --connect-timeout 5 --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -er .tag_name)
+    if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%b[!] 无法获取核心版本，未替换现有核心%b\n' "$RED" "$NC"
+        return 1
+    fi
     ver="${tag#v}"
-    url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-linux-${arch}.tar.gz"
-    tmp_dir=$(mktemp -d /tmp/sbx_core_XXXXXX)
-    if curl -fsSL --connect-timeout 10 -o "${tmp_dir}/sb.tar.gz" "$url"; then
-        tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
-        local found_bin
-        found_bin=$(find "$tmp_dir" -type f -name "sing-box" | head -1)
-        if [ -n "$found_bin" ]; then
-            install -m 755 "$found_bin" "$BIN_FILE"
-            rm -rf "$tmp_dir"
-            printf '%b[OK] Sing-box 已就绪: %s%b\n' "$GREEN" "$("$BIN_FILE" version | head -1)" "$NC"
-            return 0
-        fi
+    member="sing-box-${ver}-linux-${arch}/sing-box"
+    url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${member%/*}.tar.gz"
+    tmp_dir=$(mktemp -d "${BIN_FILE}.XXXXXX") || return 1
+    if curl -fsSL --connect-timeout 10 --max-time 180 -o "$tmp_dir/sb.tar.gz" "$url" &&
+       tar -xOzf "$tmp_dir/sb.tar.gz" "$member" > "$tmp_dir/sing-box" &&
+       chmod 755 "$tmp_dir/sing-box" && version=$("$tmp_dir/sing-box" version) &&
+       { [ ! -f "$CONFIG_FILE" ] || "$tmp_dir/sing-box" check -c "$CONFIG_FILE"; } &&
+       mv -f "$tmp_dir/sing-box" "$BIN_FILE"; then
+        printf '%b[OK] %s%b\n' "$GREEN" "${version%%$'\n'*}" "$NC"
+        rc=0
+    else
+        printf '%b[!] 下载、校验或安装失败，未替换现有核心%b\n' "$RED" "$NC"
     fi
     rm -rf "$tmp_dir"
-    printf '%b[!] 下载或安装 Sing-box 失败%b\n' "$RED" "$NC"
-    return 1
+    return "$rc"
 }
 
 deploy_sbx_service() {
@@ -113,12 +116,21 @@ EOF
 }
 
 sbx_backup_config() {
-    ensure_dirs
-    [ -f "$CONFIG_FILE" ] || return 0
-    cp -pf "$CONFIG_FILE" "${BACKUP_DIR}/config_$(date +'%Y%m%d_%H%M%S').json" 2>/dev/null || true
-    local old_baks
-    old_baks=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | tail -n +11)
-    [ -n "$old_baks" ] && rm -f $old_baks 2>/dev/null || true
+    local backup
+    backup=$(mktemp "$BACKUP_DIR/config_$(date +'%Y%m%d_%H%M%S')_XXXXXX.json") || return 1
+    if ! cp -p "$CONFIG_FILE" "$backup" ||
+       { [ -f "$STATE_FILE" ] && ! cp -p "$STATE_FILE" "${backup%.json}.state"; }; then
+        rm -f "$backup" "${backup%.json}.state"
+        return 1
+    fi
+    printf '%s\n' "$backup"
+}
+
+_sbx_prune_backups() {
+    local old
+    while IFS= read -r old; do
+        rm -f "$old" "${old%.json}.state"
+    done < <(ls -1t "$BACKUP_DIR"/config_*.json 2>/dev/null | tail -n +11)
 }
 
 sbx_check_config() {
@@ -127,39 +139,43 @@ sbx_check_config() {
 }
 
 sbx_apply_config_safe() {
-    local candidate="$1"
-    if [ ! -s "$candidate" ]; then
-        printf '%b[!] 待写入配置为空%b\n' "$RED" "$NC"
-        rm -f "$candidate"
-        return 1
+    local candidate="$1" state="${2:-}" backup check_err
+    if [ ! -s "$candidate" ] || { [ -n "$state" ] && ! jq -e 'type == "object"' "$state" >/dev/null; }; then
+        printf '%b[!] 待写入的配置或状态无效%b\n' "$RED" "$NC"
+    elif ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
+        printf '\n%b[核心预检失败] 原配置未改动:%b\n%s\n' "$RED$BOLD" "$NC" "$check_err"
+    elif ! backup=$(sbx_backup_config); then
+        printf '%b[!] 无法备份，原配置未改动%b\n' "$RED" "$NC"
+    elif mv -f "$candidate" "$CONFIG_FILE" && _sbx_restart_checked &&
+         { [ -z "$state" ] || mv -f "$state" "$STATE_FILE"; }; then
+        _sbx_prune_backups
+        return 0
+    elif cp -pf "$backup" "$CONFIG_FILE" && _sbx_restart_checked; then
+        printf '\n%b[!] 应用失败，已恢复上一版配置并重启%b\n' "$RED" "$NC"
+    else
+        printf '\n%b[!] 应用失败且未能验证旧服务恢复，请检查日志。备份: %s%b\n' "$RED" "$backup" "$NC"
     fi
-    local check_err
-    if ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
-        printf '\n%b[核心预检失败] 配置未通过 Sing-box 校验，原配置未改动:%b\n%b%s%b\n' "$RED$BOLD" "$NC" "$YELLOW" "$check_err" "$NC"
-        rm -f "$candidate"
-        return 1
-    fi
-    sbx_backup_config
-    mv -f "$candidate" "$CONFIG_FILE"
-    sbx_svc_action restart >/dev/null 2>&1 || true
+    rm -f "$candidate"
+    [ -z "$state" ] || rm -f "$state"
+    return 1
+}
+
+_sbx_restart_checked() {
+    sbx_svc_action restart || return 1
     sleep 0.5
-    if [ "$INIT_SYS" = "systemd" ] && ! systemctl is-active --quiet sbx.service 2>/dev/null; then
-        local latest_bak
-        latest_bak=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | head -1)
-        if [ -n "$latest_bak" ]; then
-            printf '\n%b[!] 服务启动异常，已自动回滚至上一版本%b\n' "$RED" "$NC"
-            cp -pf "$latest_bak" "$CONFIG_FILE"
-            sbx_svc_action restart >/dev/null 2>&1 || true
-        fi
-        return 1
-    fi
-    return 0
+    case "$INIT_SYS" in
+        systemd) systemctl is-active --quiet sbx.service ;;
+        openrc) rc-service sbx status ;;
+        *) return 1 ;;
+    esac
 }
 
 sbx_svc_action() {
-    local act="$1"
-    [ "$INIT_SYS" = "systemd" ] && systemctl "$act" sbx.service
-    [ "$INIT_SYS" = "openrc" ] && rc-service sbx "$act"
+    case "$INIT_SYS" in
+        systemd) systemctl "$1" sbx.service ;;
+        openrc) rc-service sbx "$1" ;;
+        *) return 1 ;;
+    esac
 }
 
 manage_service() {
@@ -199,12 +215,24 @@ manage_service() {
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#b_list[@]}" ]; then
                     local target="${b_list[$((choice - 1))]}"
                     if confirm_action "恢复 $(basename "$target")？"; then
-                        cp -pf "$target" "$CONFIG_FILE"
-                        sbx_svc_action restart >/dev/null 2>&1 || true
-                        printf '%b[OK] 已恢复并重启%b\n' "$GREEN" "$NC"; pause_for_enter
+                        acquire_lock || continue
+                        local candidate state=""
+                        candidate=$(mktemp "${CONFIG_FILE}.XXXXXX") || continue
+                        if [ -f "${target%.json}.state" ]; then
+                            state=$(mktemp "${STATE_FILE}.XXXXXX") && cp "${target%.json}.state" "$state" || {
+                                rm -f "$candidate" "$state"; continue;
+                            }
+                        elif ! confirm_action "旧备份没有面板状态，仅恢复核心配置可能导致显示不一致，继续？"; then
+                            rm -f "$candidate"; continue
+                        fi
+                        if cp "$target" "$candidate" && sbx_apply_config_safe "$candidate" "$state"; then
+                            printf '%b[OK] 已恢复并重启%b\n' "$GREEN" "$NC"
+                        fi
+                        rm -f "$candidate" "$state"
+                        pause_for_enter
                     fi
                 fi ;;
-            7) rm -f "$BIN_FILE"; install_singbox_bin; pause_for_enter ;;
+            7) acquire_lock && install_singbox_bin update; pause_for_enter ;;
             0) return 0 ;;
         esac
     done

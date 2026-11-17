@@ -142,11 +142,15 @@ EOF
 _run_remote_script() {
     local title="$1" url="$2"
     menu_header "$title"
-    confirm_action "下载并运行 ${url}？" "y" || return 0
+    confirm_action "以 root 执行 ${url} 提供的第三方脚本（未验证完整性），继续？" || return 0
     local tmp
     tmp=$(mktemp /tmp/sbx_ext_XXXXXX) || return 1
-    if curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp" 2>/dev/null || wget -qO "$tmp" "$url" 2>/dev/null; then
-        grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$tmp" && bash "$tmp" || printf '%b[!] 脚本校验失败%b\n' "$RED" "$NC"
+    if curl -qfsSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp" 2>/dev/null || wget -T 15 -t 1 -qO "$tmp" "$url" 2>/dev/null; then
+        if [ -s "$tmp" ] && bash -n "$tmp"; then
+            bash "$tmp" || printf '%b[!] 第三方脚本执行失败%b\n' "$RED" "$NC"
+        else
+            printf '%b[!] 下载内容为空或不符合 Bash 语法%b\n' "$RED" "$NC"
+        fi
     else
         printf '%b[!] 下载失败%b\n' "$RED" "$NC"
     fi

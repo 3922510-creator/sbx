@@ -6,6 +6,8 @@
 
 ### 推荐：一键安装快捷指令
 
+以 root 执行。远程安装用 `curl` 和 `tar` 获取同一份源码快照，再用 Bash 在本机生成脚本，不需要 Python。
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/install.sh)
 ```
@@ -19,7 +21,7 @@ sbx
 ### 免安装单次运行
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/sbx.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/install.sh) --run
 ```
 
 ---
@@ -44,7 +46,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/sbx
 ### 3. Sing-box 代理管理
 - **VLESS-Reality 节点搭建**：自动安装最新官方核心，自动生成 Reality 密钥对、UUID、短 ID 与伪装域名，生成客户端分享链接与终端二维码。
 - **TCP / UDP 端口转发**：基于 Sing-box direct 模式的轻量中转，支持自定义本机监听端口与目标地址。
-- **WARP 出口分流**：生成 WireGuard 出口，支持将 OpenAI (ChatGPT) 或主流流媒体流量按需分流走 WARP。
+- **WARP 出口分流**：支持全局、指定节点、AI、流媒体和自定义域名分流。接入后会检测公网出口，也可从 WARP 菜单选 `3` 重新查询。面板区分 WireGuard 隧道地址和 Cloudflare Trace 实测的公网出口 IP；检测使用独立的临时回环代理，不会切换现有服务的分流模式。
 - **核心与服务维护**：查看实时运行状态与日志，配置语法自动校验与历史备份一键回滚。
 
 ### 4. 彻底卸载与残留清理
@@ -58,8 +60,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/sbx
 
 ## 目录结构
 
-- `sbx.sh`: 编译生成的单文件分发脚本
-- `install.sh`: 一键安装器
+- `install.sh`: 一键安装器，也可在源码目录内运行 `bash install.sh --run` 临时使用。
 - `src/`: 模块化源码（header, system, network, proxy_core, proxy_nodes, proxy_features, uninstall, menus）
-- `tools/build.py`: 单文件构建工具
+- `tools/build.sh`: 单文件构建工具，运行 `bash tools/build.sh sbx.sh` 可在本地生成独立脚本，生成物不提交。
 - `tests/`: 自动化测试用例
