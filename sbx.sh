@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =====================================================================
-# 项目名称: SBX (Sing-box & Linux VPS 管理面板)
-# 版本: v5.0.0
+# 项目名称: SBX (Sing-box & Linux VPS 工具箱)
+# 版本: v5.1.0
 # 快捷指令: sbx
 # =====================================================================
 set -o pipefail
-SBX_VERSION="v5.0.0"
+SBX_VERSION="v5.1.0"
 
 # ---------- ANSI 颜色与修饰 ----------
 RED='\033[0;31m'
@@ -67,28 +67,22 @@ clear_screen() {
 get_term_width() {
     local w="${COLUMNS:-0}"
     case "$w" in ''|*[!0-9]*) w=0 ;; esac
-    if [ "$w" -eq 0 ]; then
-        w=$(stty size 2>/dev/null | awk '{print $2}') || w=''
-    fi
-    case "$w" in ''|*[!0-9]*) w=62 ;; esac
+    [ "$w" -gt 0 ] || w=$(stty size 2>/dev/null | awk '{print $2}') || w=''
+    case "$w" in ''|*[!0-9]*) w=60 ;; esac
     [ "$w" -ge 46 ] || w=46
-    [ "$w" -le 72 ] || w=72
+    [ "$w" -le 68 ] || w=68
     printf '%s' "$w"
 }
 
 print_divider() {
     local w line="" i=0
     w=$(get_term_width)
-    while [ "$i" -lt "$w" ]; do
-        line="${line}─"
-        i=$((i + 1))
-    done
+    while [ "$i" -lt "$w" ]; do line="${line}─"; i=$((i + 1)); done
     printf '%b%s%b\n' "${DIM}${CYAN}" "$line" "$NC"
 }
 
 print_center() {
-    local text="$1" color="${2:-$NC}"
-    local clean_text w pad_left i=0
+    local text="$1" color="${2:-$NC}" clean_text w pad_left
     clean_text=$(printf '%b' "$text" | sed 's/\x1b\[[0-9;]*m//g')
     w=$(get_term_width)
     pad_left=$(( (w - ${#clean_text}) / 2 ))
@@ -98,35 +92,24 @@ print_center() {
 
 pause_for_enter() {
     printf '\n'
-    read -rp "  按回车键继续..." _ || return 0
+    read -rp "  回车继续..." _ || return 0
 }
 
 confirm_action() {
     local prompt="$1" default="${2:-n}" answer
     printf '\n%b%s%b\n' "$YELLOW" "$prompt" "$NC"
-    if [ "$default" = "y" ]; then
-        read -rp "确认执行？回复 y / n [默认 y]: " answer || return 1
-        answer="${answer:-y}"
-    else
-        read -rp "确认执行？回复 y / n [默认 n]: " answer || return 1
-        answer="${answer:-n}"
-    fi
+    read -rp "确认执行？回复 y / n [默认 ${default}]: " answer || return 1
+    answer="${answer:-$default}"
     [ "$answer" = "y" ] || [ "$answer" = "Y" ]
 }
 
-# 双列菜单输出（参考 vpsbox 布局，字符精确对齐）
 menu_pair() {
-    local num1="$1" txt1="$2" num2="$3" txt2="$4"
-    local col_w=28
-    # 左列
-    local left_str right_str
+    local num1="$1" txt1="$2" num2="$3" txt2="$4" col_w=27
+    local left_str right_str clean_left pad
     left_str=$(printf "  %b%2s.%b %s" "$GREEN" "$num1" "$NC" "$txt1")
-    # 计算左列可见字符宽度以做补齐
-    local clean_left pad
     clean_left=$(printf "  %2s. %s" "$num1" "$txt1")
     pad=$((col_w - ${#clean_left}))
     [ "$pad" -gt 0 ] || pad=1
-
     if [ -n "$num2" ]; then
         right_str=$(printf "%b%2s.%b %s" "$GREEN" "$num2" "$NC" "$txt2")
         printf "%s%*s%s\n" "$left_str" "$pad" "" "$right_str"
@@ -136,8 +119,7 @@ menu_pair() {
 }
 
 menu_single() {
-    local num="$1" txt="$2"
-    printf "  %b%2s.%b %s\n" "$GREEN" "$num" "$NC" "$txt"
+    printf "  %b%2s.%b %s\n" "$GREEN" "$1" "$NC" "$2"
 }
 
 menu_header() {
@@ -145,24 +127,22 @@ menu_header() {
     print_divider
     print_center "$1" "$PURPLE$BOLD"
     print_divider
-    printf '\n'
 }
 
 _read_menu_choice() {
-    local var_name="${1:-OPTION}" prompt="${2:-> 请选择: }"
+    local var_name="${1:-OPTION}" prompt="${2:-> 选择: }"
     printf '\n%b%s%b' "$CYAN" "$prompt" "$NC"
     read -r REPLY || REPLY=0
     REPLY="${REPLY// /}"
     eval "$var_name=\"\$REPLY\""
 }
 
-# ---------- 并发锁机制 ----------
 acquire_lock() {
     command -v flock >/dev/null 2>&1 || return 0
     [ "${SBX_LOCKED:-0}" = 1 ] && return 0
     exec 210>"$LOCK_FILE" || return 1
     flock -n 210 || {
-        printf '%b[!] 另一个 sbx 实例正在执行操作，请稍候。%b\n' "$RED" "$NC" >&2
+        printf '%b[!] 另一个 sbx 实例正在运行%b\n' "$RED" "$NC" >&2
         return 1
     }
     SBX_LOCKED=1
@@ -182,446 +162,250 @@ _get_public_ip() {
 }
 
 system_overview() {
-    menu_header "系统信息与资源概览"
-    printf '  %b正在收集系统实时状态...%b\n\n' "$DIM" "$NC"
-
-    local os_info cpu_model cpu_cores cpu_freq virt_type
+    menu_header "系统信息总览"
+    local os_info cpu_model cpu_cores cpu_freq virt_type cpu_usage mem_info swap_info disk_info load uptime_str tcp_count udp_count ip_data ip4 ip6 loc
     os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)
     [ -n "$os_info" ] || os_info="$(uname -s) $(uname -r)"
-
     cpu_model=$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d':' -f2 | sed 's/^ *//')
     [ -n "$cpu_model" ] || cpu_model="$(uname -m)"
     cpu_cores=$(nproc 2>/dev/null || echo "1")
-    cpu_freq=$(awk '/^cpu MHz/{printf "%.1f GHz\n", $4/1000; exit}' /proc/cpuinfo 2>/dev/null)
-    [ -n "$cpu_freq" ] || cpu_freq="N/A"
-
+    cpu_freq=$(awk '/^cpu MHz/{printf "%.1fGHz\n", $4/1000; exit}' /proc/cpuinfo 2>/dev/null)
     virt_type=$(systemd-detect-virt 2>/dev/null || echo "none")
-    if [ "$virt_type" = "none" ] || [ -z "$virt_type" ]; then
-        if grep -qE '(vmx|svm)' /proc/cpuinfo 2>/dev/null; then
-            virt_type="KVM/独立虚拟化"
-        else
-            virt_type="物理机 / 容器"
-        fi
-    fi
+    [ "$virt_type" = "none" ] || [ -z "$virt_type" ] && virt_type="KVM / 物理机"
 
-    local cpu_usage
     cpu_usage=$(awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){u1=u;t1=t;} else printf "%.0f\n",(($2+$4-u1)*100/(t-t1))}' \
-      <(grep 'cpu ' /proc/stat) <(sleep 0.4; grep 'cpu ' /proc/stat) 2>/dev/null)
-    [ -n "$cpu_usage" ] || cpu_usage="N/A"
-
-    local mem_total mem_used mem_info swap_total swap_used swap_info disk_info
-    mem_info=$(free -m 2>/dev/null | awk 'NR==2{printf "%dM / %dM (%.0f%%)", $3, $2, ($3*100/$2)}')
-    swap_info=$(free -m 2>/dev/null | awk 'NR==3{if($2==0){printf "未启用"} else {printf "%dM / %dM (%.0f%%)", $3, $2, ($3*100/$2)}}')
-    disk_info=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s / %s (%s)", $3, $2, $5}')
-
-    local load uptime_str
+      <(grep 'cpu ' /proc/stat) <(sleep 0.3; grep 'cpu ' /proc/stat) 2>/dev/null)
+    mem_info=$(free -m 2>/dev/null | awk 'NR==2{printf "%d/%dMB (%.0f%%)", $3, $2, ($3*100/$2)}')
+    swap_info=$(free -m 2>/dev/null | awk 'NR==3{if($2==0){printf "未启用"} else {printf "%d/%dMB (%.0f%%)", $3, $2, ($3*100/$2)}}')
+    disk_info=$(df -h / 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}')
     load=$(awk '{print $1" "$2" "$3}' /proc/loadavg 2>/dev/null || echo "N/A")
-    uptime_str=$(awk -F. '{
-        days=int($1/86400); hours=int(($1%86400)/3600); mins=int(($1%3600)/60);
-        if(days>0) printf "%d天 ", days;
-        if(hours>0) printf "%d小时 ", hours;
-        printf "%d分钟", mins;
-    }' /proc/uptime 2>/dev/null || echo "N/A")
-
-    local tcp_count udp_count
+    uptime_str=$(awk -F. '{d=int($1/86400);h=int(($1%86400)/3600);m=int(($1%3600)/60);if(d>0)printf "%d天 ",d;if(h>0)printf "%d时 ",h;printf "%d分",m}' /proc/uptime 2>/dev/null)
     tcp_count=$(ss -t -a 2>/dev/null | grep -c ESTAB || echo "0")
     udp_count=$(ss -u -a 2>/dev/null | grep -c UNCONN || echo "0")
 
-    local ip_data ip4 ip6 loc
     ip_data=$(_get_public_ip)
     ip4=$(echo "$ip_data" | cut -d'|' -f1)
     ip6=$(echo "$ip_data" | cut -d'|' -f2)
     loc=$(echo "$ip_data" | cut -d'|' -f3)
 
-    printf "  %b系统环境:%b  %s\n" "$CYAN" "$NC" "$os_info"
-    printf "  %b虚拟架构:%b  %s (%s)\n" "$CYAN" "$NC" "$virt_type" "$(uname -m)"
-    printf "  %bCPU 信息:%b  %s (%s 核 · %s)\n" "$CYAN" "$NC" "$cpu_model" "$cpu_cores" "$cpu_freq"
-    printf "  %bCPU 占用:%b  %s%%\n" "$CYAN" "$NC" "$cpu_usage"
-    printf "  %b系统负载:%b  %s\n" "$CYAN" "$NC" "$load"
-    printf "  %b内存占用:%b  %s\n" "$CYAN" "$NC" "$mem_info"
-    printf "  %bSwap 占用:%b  %s\n" "$CYAN" "$NC" "$swap_info"
-    printf "  %b根盘占用:%b  %s\n" "$CYAN" "$NC" "$disk_info"
-    printf "  %b连接统计:%b  TCP(已建立): %s · UDP: %s\n" "$CYAN" "$NC" "$tcp_count" "$udp_count"
-    printf "  %b开机时长:%b  %s\n" "$CYAN" "$NC" "$uptime_str"
+    printf "  %b系统:%b %s (%s · %s)\n" "$CYAN" "$NC" "$os_info" "$virt_type" "$(uname -m)"
+    printf "  %bCPU :%b %s (%s核 %s) · 占用 %s%%\n" "$CYAN" "$NC" "$cpu_model" "$cpu_cores" "${cpu_freq:-}" "${cpu_usage:-0}"
+    printf "  %b负载:%b %s  |  %b运行:%b %s\n" "$CYAN" "$NC" "$load" "$CYAN" "$NC" "$uptime_str"
+    printf "  %b内存:%b %s  |  %bSwap:%b %s\n" "$CYAN" "$NC" "$mem_info" "$CYAN" "$NC" "$swap_info"
+    printf "  %b硬盘:%b %s  |  %b连接:%b TCP %s / UDP %s\n" "$CYAN" "$NC" "$disk_info" "$CYAN" "$NC" "$tcp_count" "$udp_count"
     print_divider
-    printf "  %bIPv4 地址:%b  %s %s\n" "$CYAN" "$NC" "${ip4:-无}" "${loc:+($loc)}"
-    printf "  %bIPv6 地址:%b  %s\n" "$CYAN" "$NC" "${ip6:-无}"
+    printf "  %bIPv4:%b %s %s\n" "$CYAN" "$NC" "${ip4:-无}" "${loc:+($loc)}"
+    printf "  %bIPv6:%b %s\n" "$CYAN" "$NC" "${ip6:-无}"
     print_divider
-
     pause_for_enter
 }
 
 system_update() {
-    menu_header "系统更新与基础组件安装"
-    if ! confirm_action "更新系统包管理器源并安装常用基础组件？"; then return 0; fi
-
-    printf '\n%b>>> 正在检测包管理器并执行系统更新...%b\n' "$CYAN" "$NC"
+    menu_header "系统更新与组件安装"
+    confirm_action "更新系统源并安装基础组件 (curl/wget/git/jq/socat/htop/unzip)？" || return 0
+    local pkgs="curl wget git jq tar socat htop unzip ca-certificates iptables util-linux"
     case "$OS_FAMILY" in
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y && apt-get upgrade -y
-            apt-get install -y curl wget git jq tar socat htop unzip ca-certificates iptables util-linux
-            ;;
-        redhat)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf update -y
-                dnf install -y curl wget git jq tar socat htop unzip ca-certificates iptables util-linux
-            else
-                yum update -y
-                yum install -y curl wget git jq tar socat htop unzip ca-certificates iptables util-linux
-            fi
-            ;;
-        alpine)
-            apk update && apk upgrade
-            apk add --no-cache curl wget git jq tar socat htop unzip ca-certificates iptables util-linux
-            ;;
-        arch)
-            pacman -Syu --noconfirm
-            pacman -S --noconfirm curl wget git jq tar socat htop unzip ca-certificates iptables util-linux
-            ;;
-        *)
-            printf '%b[!] 未知或暂不支持自动更新的 Linux 发行版。%b\n' "$YELLOW" "$NC"
-            ;;
+        debian) export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get upgrade -y && apt-get install -y $pkgs ;;
+        redhat) (command -v dnf >/dev/null 2>&1 && dnf update -y && dnf install -y $pkgs) || (yum update -y && yum install -y $pkgs) ;;
+        alpine) apk update && apk upgrade && apk add --no-cache $pkgs ;;
+        arch)   pacman -Syu --noconfirm && pacman -S --noconfirm $pkgs ;;
+        *)      printf '%b[!] 暂不支持该发行版自动更新%b\n' "$YELLOW" "$NC" ;;
     esac
-
-    printf '\n%b[成功] 系统更新与基础工具集已就绪。%b\n' "$GREEN" "$NC"
+    printf '\n%b[OK] 系统更新完成%b\n' "$GREEN" "$NC"
     pause_for_enter
 }
 
 system_clean() {
-    menu_header "系统垃圾与日志清理"
-    if ! confirm_action "清理系统包管理器缓存、废弃依赖与冗余日志？"; then return 0; fi
-
-    printf '\n%b>>> 正在清理系统垃圾与无用依赖...%b\n' "$CYAN" "$NC"
+    menu_header "系统垃圾清理"
+    confirm_action "清理包缓存、无用依赖、过期日志与临时文件？" || return 0
     case "$OS_FAMILY" in
-        debian)
-            apt-get autoremove --purge -y
-            apt-get clean -y
-            apt-get autoclean -y
-            ;;
-        redhat)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf autoremove -y
-                dnf clean all
-            else
-                yum autoremove -y
-                yum clean all
-            fi
-            ;;
-        alpine)
-            apk cache clean
-            rm -rf /var/cache/apk/*
-            ;;
+        debian) apt-get autoremove --purge -y; apt-get clean -y; apt-get autoclean -y ;;
+        redhat) (command -v dnf >/dev/null 2>&1 && dnf autoremove -y && dnf clean all) || (yum autoremove -y && yum clean all) ;;
+        alpine) apk cache clean; rm -rf /var/cache/apk/* ;;
     esac
-
-    # 清理 systemd 日志
     if command -v journalctl >/dev/null 2>&1; then
         journalctl --rotate 2>/dev/null || true
-        journalctl --vacuum-time=2d 2>/dev/null || true
-        journalctl --vacuum-size=50M 2>/dev/null || true
+        journalctl --vacuum-time=2d --vacuum-size=50M 2>/dev/null || true
     fi
-
-    # 清理 /tmp 临时过期文件（>2天）
-    find /tmp -mindepth 1 -mtime +2 -delete 2>/dev/null || true
-    find /var/tmp -mindepth 1 -mtime +2 -delete 2>/dev/null || true
-
-    printf '\n%b[成功] 系统垃圾与日志清理完成！%b\n' "$GREEN" "$NC"
+    find /tmp /var/tmp -mindepth 1 -mtime +2 -delete 2>/dev/null || true
+    printf '\n%b[OK] 清理完成%b\n' "$GREEN" "$NC"
     pause_for_enter
 }
 
 change_root_password() {
-    menu_header "修改 Root 用户密码"
-    printf '  %b提示: 输入时字符不回显，请仔细输入。%b\n\n' "$YELLOW" "$NC"
-
+    menu_header "修改 Root 密码"
     local p1 p2
-    read -rsp "  请输入新的 Root 密码: " p1
-    printf '\n'
-    [ -n "$p1" ] || { printf '%b[!] 密码不能为空。%b\n' "$RED" "$NC"; pause_for_enter; return 0; }
-
-    read -rsp "  请再次确认 Root 密码: " p2
-    printf '\n'
-    if [ "$p1" != "$p2" ]; then
-        printf '%b[!] 两次密码输入不一致，已取消。%b\n' "$RED" "$NC"
-        pause_for_enter
-        return 0
-    fi
-
-    if echo "root:${p1}" | chpasswd 2>/dev/null || echo -e "${p1}\n${p1}" | passwd root 2>/dev/null; then
-        printf '\n%b[成功] Root 密码已修改成功，请牢记新密码！%b\n' "$GREEN" "$NC"
+    read -rsp "  输入新 Root 密码 (不回显): " p1; printf '\n'
+    [ -n "$p1" ] || { printf '%b[!] 密码不能为空%b\n' "$RED" "$NC"; pause_for_enter; return 0; }
+    read -rsp "  再次确认新密码: " p2; printf '\n'
+    [ "$p1" = "$p2" ] || { printf '%b[!] 两次输入不一致%b\n' "$RED" "$NC"; pause_for_enter; return 0; }
+    if echo "root:${p1}" | chpasswd 2>/dev/null || printf '%s\n%s\n' "$p1" "$p1" | passwd root 2>/dev/null; then
+        printf '\n%b[OK] Root 密码已更新%b\n' "$GREEN" "$NC"
     else
-        printf '\n%b[错误] 修改 Root 密码失败。%b\n' "$RED" "$NC"
+        printf '\n%b[!] 修改失败%b\n' "$RED" "$NC"
     fi
     pause_for_enter
 }
 
+_set_tz() {
+    local tz="$1"
+    if command -v timedatectl >/dev/null 2>&1 && timedatectl set-timezone "$tz" 2>/dev/null; then
+        printf '%b[OK] 时区已设为 %s%b\n' "$GREEN" "$tz" "$NC"
+    elif [ -e "/usr/share/zoneinfo/${tz}" ]; then
+        ln -sf "/usr/share/zoneinfo/${tz}" /etc/localtime
+        echo "$tz" > /etc/timezone 2>/dev/null || true
+        printf '%b[OK] 时区已设为 %s%b\n' "$GREEN" "$tz" "$NC"
+    else
+        printf '%b[!] 无效时区: %s%b\n' "$RED" "$tz" "$NC"
+    fi
+}
+
 manage_host_time() {
     while true; do
-        menu_header "主机名与时区配置"
-        local cur_host cur_tz cur_time
+        menu_header "主机名与时区"
+        local cur_host cur_tz
         cur_host=$(hostname 2>/dev/null || echo "未知")
         cur_tz=$(cat /etc/timezone 2>/dev/null || timedatectl 2>/dev/null | awk '/Time zone:/{print $3}' || echo "UTC")
-        cur_time=$(date +"%Y-%m-%d %H:%M:%S %Z")
-
-        printf "  %b当前主机名:%b  %s\n" "$CYAN" "$NC" "$cur_host"
-        printf "  %b当前时区:  %b  %s (%s)\n\n" "$CYAN" "$NC" "$cur_tz" "$cur_time"
-
-        menu_single 1 "修改系统主机名 (Hostname)"
-        menu_single 2 "一键切换为中国标准时间 (Asia/Shanghai)"
-        menu_single 3 "自定义切换系统时区"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice ht_opt "> 请选择操作 [0-3]: "
+        printf "  %b主机名:%b %s  |  %b时区:%b %s (%s)\n\n" "$CYAN" "$NC" "$cur_host" "$CYAN" "$NC" "$cur_tz" "$(date +'%H:%M:%S %Z')"
+        menu_single 1 "修改主机名"
+        menu_single 2 "设为北京时间 (Asia/Shanghai)"
+        menu_single 3 "自定义时区"
+        menu_single 0 "返回"
+        _read_menu_choice ht_opt "> 选择 [0-3]: "
         case "$ht_opt" in
             1)
                 local new_host
-                printf '\n'
-                read -rp "  请输入新的主机名: " new_host
-                new_host="${new_host// /}"
-                [ -n "$new_host" ] || continue
-                if confirm_action "修改系统主机名为: ${new_host}？"; then
-                    if command -v hostnamectl >/dev/null 2>&1; then
-                        hostnamectl set-hostname "$new_host"
-                    else
-                        echo "$new_host" > /etc/hostname
-                        hostname "$new_host" 2>/dev/null || true
-                    fi
-                    # 同步 /etc/hosts 避免 sudo 报警
-                    if [ -f /etc/hosts ]; then
-                        sed -i "/127.0.1.1/d" /etc/hosts 2>/dev/null || true
-                        echo "127.0.1.1 $new_host" >> /etc/hosts
-                    fi
-                    printf '%b[成功] 主机名已更新为: %s%b\n' "$GREEN" "$new_host" "$NC"
-                    pause_for_enter
-                fi
-                ;;
-            2)
-                if confirm_action "将系统时区修改为 Asia/Shanghai (UTC+8)？"; then
-                    if command -v timedatectl >/dev/null 2>&1; then
-                        timedatectl set-timezone "Asia/Shanghai"
-                    elif [ -e /usr/share/zoneinfo/Asia/Shanghai ]; then
-                        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-                        echo "Asia/Shanghai" > /etc/timezone 2>/dev/null || true
-                    fi
-                    printf '%b[成功] 时区已更新为 Asia/Shanghai！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                read -rp "  新主机名: " new_host; new_host="${new_host// /}"
+                [ -n "$new_host" ] && confirm_action "修改主机名为 ${new_host}？" || continue
+                command -v hostnamectl >/dev/null 2>&1 && hostnamectl set-hostname "$new_host" || { echo "$new_host" > /etc/hostname; hostname "$new_host" 2>/dev/null || true; }
+                [ -f /etc/hosts ] && { sed -i "/127.0.1.1/d" /etc/hosts 2>/dev/null || true; echo "127.0.1.1 $new_host" >> /etc/hosts; }
+                printf '%b[OK] 主机名已设为 %s%b\n' "$GREEN" "$new_host" "$NC"; pause_for_enter ;;
+            2) confirm_action "切换时区为 Asia/Shanghai？" && { _set_tz "Asia/Shanghai"; pause_for_enter; } ;;
             3)
                 local new_tz
-                printf '\n'
-                read -rp "  请输入目标时区 (如 UTC / America/New_York): " new_tz
-                new_tz="${new_tz// /}"
-                [ -n "$new_tz" ] || continue
-                if command -v timedatectl >/dev/null 2>&1; then
-                    if timedatectl set-timezone "$new_tz" 2>/dev/null; then
-                        printf '%b[成功] 时区已更新为: %s%b\n' "$GREEN" "$new_tz" "$NC"
-                    else
-                        printf '%b[错误] 时区名称无效。%b\n' "$RED" "$NC"
-                    fi
-                elif [ -e "/usr/share/zoneinfo/${new_tz}" ]; then
-                    ln -sf "/usr/share/zoneinfo/${new_tz}" /etc/localtime
-                    echo "$new_tz" > /etc/timezone 2>/dev/null || true
-                    printf '%b[成功] 时区已更新为: %s%b\n' "$GREEN" "$new_tz" "$NC"
-                else
-                    printf '%b[错误] 找不到时区文件。%b\n' "$RED" "$NC"
-                fi
-                pause_for_enter
-                ;;
+                read -rp "  目标时区 (如 UTC / America/New_York): " new_tz; new_tz="${new_tz// /}"
+                [ -n "$new_tz" ] && { _set_tz "$new_tz"; pause_for_enter; } ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
 
-# ==================== 网络优化与系统安全 ====================
+# ==================== 网络优化与安全 ====================
 
-# ---------- Swap 虚拟内存管理 ----------
 manage_swap() {
     while true; do
-        menu_header "Swap 虚拟内存管理"
-        local swap_total swap_used swap_path
+        menu_header "Swap 虚拟内存"
+        local swap_total swap_used
         swap_total=$(free -m 2>/dev/null | awk 'NR==3{print $2}')
         swap_used=$(free -m 2>/dev/null | awk 'NR==3{print $3}')
-        swap_path=$(swapon --show=NAME --noheadings 2>/dev/null | head -1)
-
-        printf "  %b当前 Swap 状态:%b " "$CYAN" "$NC"
         if [ -z "$swap_total" ] || [ "$swap_total" -eq 0 ]; then
-            printf "%b未启用%b\n\n" "$YELLOW" "$NC"
+            printf "  %b状态:%b %b未启用%b\n\n" "$CYAN" "$NC" "$YELLOW" "$NC"
         else
-            printf "%b%s MB / %s MB (已用: %s MB)%b\n" "$GREEN" "$swap_used" "$swap_total" "$swap_used" "$NC"
-            printf "  %b当前 Swap 文件:%b %s\n\n" "$CYAN" "$NC" "${swap_path:-分区}"
+            printf "  %b状态:%b %b%s / %s MB%b\n\n" "$CYAN" "$NC" "$GREEN" "$swap_used" "$swap_total" "$NC"
         fi
-
-        menu_single 1 "创建 / 重设为 1GB Swap"
-        menu_single 2 "创建 / 重设为 2GB Swap"
-        menu_single 3 "创建 / 重设为 4GB Swap"
-        menu_single 4 "自定义大小 (MB)"
-        menu_single 5 "彻底关闭并删除 Swap"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice swap_opt "> 请选择操作 [0-5]: "
+        menu_pair 1 "设为 1GB" 2 "设为 2GB"
+        menu_pair 3 "设为 4GB" 4 "自定义大小"
+        menu_single 5 "关闭并删除 Swap"
+        menu_single 0 "返回"
+        _read_menu_choice swap_opt "> 选择 [0-5]: "
         local mb_size=0
         case "$swap_opt" in
             1) mb_size=1024 ;;
             2) mb_size=2048 ;;
             3) mb_size=4096 ;;
             4)
-                printf '\n'
-                read -rp "  请输入 Swap 大小 (MB): " mb_size
-                mb_size="${mb_size// /}"
-                [[ "$mb_size" =~ ^[0-9]+$ ]] && [ "$mb_size" -ge 128 ] || {
-                    printf '%b[!] 输入无效，大小至少为 128MB。%b\n' "$RED" "$NC"
-                    pause_for_enter; continue;
-                }
-                ;;
+                read -rp "  输入大小 (MB, >=128): " mb_size; mb_size="${mb_size// /}"
+                [[ "$mb_size" =~ ^[0-9]+$ ]] && [ "$mb_size" -ge 128 ] || { printf '%b[!] 大小无效%b\n' "$RED" "$NC"; pause_for_enter; continue; } ;;
             5)
-                if confirm_action "彻底关闭并删除 /swapfile？"; then
-                    swapoff -a 2>/dev/null || true
-                    sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true
-                    rm -f /swapfile
-                    printf '\n%b[成功] Swap 已安全停用并清理。%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                continue
-                ;;
+                confirm_action "关闭并删除 /swapfile？" || continue
+                swapoff -a 2>/dev/null || true; sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true; rm -f /swapfile
+                printf '%b[OK] Swap 已移除%b\n' "$GREEN" "$NC"; pause_for_enter; continue ;;
             0) return 0 ;;
-            *) sleep 1; continue ;;
+            *) continue ;;
         esac
-
-        if [ "$mb_size" -gt 0 ]; then
-            if ! confirm_action "确认分配 ${mb_size} MB 虚拟内存？"; then continue; fi
-            printf '\n%b>>> 正在分配 Swap 空间并格式化...%b\n' "$CYAN" "$NC"
-            swapoff -a 2>/dev/null || true
-            sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true
-            rm -f /swapfile
-
-            if ! fallocate -l "${mb_size}M" /swapfile 2>/dev/null; then
-                dd if=/dev/zero of=/swapfile bs=1M count="$mb_size" status=progress
-            fi
-            chmod 600 /swapfile
-            mkswap /swapfile >/dev/null 2>&1
-            swapon /swapfile >/dev/null 2>&1
-
-            if ! grep -q '/swapfile' /etc/fstab; then
-                echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
-            fi
-            sysctl -w vm.swappiness=20 >/dev/null 2>&1 || true
-
-            printf '\n%b[成功] Swap 已成功分配并设为开机自启！%b\n' "$GREEN" "$NC"
-            pause_for_enter
-        fi
+        confirm_action "分配 ${mb_size} MB Swap？" || continue
+        swapoff -a 2>/dev/null || true; sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true; rm -f /swapfile
+        fallocate -l "${mb_size}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="$mb_size" status=none
+        chmod 600 /swapfile && mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile >/dev/null 2>&1
+        grep -q '/swapfile' /etc/fstab || echo '/swapfile swap swap defaults 0 0' >> /etc/fstab
+        sysctl -w vm.swappiness=20 >/dev/null 2>&1 || true
+        printf '%b[OK] Swap (%sMB) 已启用%b\n' "$GREEN" "$mb_size" "$NC"
+        pause_for_enter
     done
 }
 
-# ---------- DNS 优化与设置 ----------
 _apply_dns() {
-    local d1="$1" d2="$2"
-    local bak="/etc/resolv.conf.sbx_bak"
+    local d1="$1" d2="${2:-$1}" bak="/etc/resolv.conf.sbx_bak"
     [ -f "$bak" ] || cp -p /etc/resolv.conf "$bak" 2>/dev/null || true
-
-    # 解除不可修改属性（若有）
     chattr -i /etc/resolv.conf 2>/dev/null || true
-    cat > /etc/resolv.conf <<EOF
-nameserver ${d1}
-nameserver ${d2}
-options timeout:2 attempts:3 rotate
-EOF
-    printf '\n%b[成功] DNS 已更新为: %s, %s%b\n' "$GREEN" "$d1" "$d2" "$NC"
+    printf 'nameserver %s\nnameserver %s\noptions timeout:2 attempts:3 rotate\n' "$d1" "$d2" > /etc/resolv.conf
+    printf '%b[OK] DNS 已设为: %s, %s%b\n' "$GREEN" "$d1" "$d2" "$NC"
 }
 
 optimize_dns() {
     while true; do
-        menu_header "DNS 解析优化与修改"
+        menu_header "DNS 优化"
         local cur_dns
         cur_dns=$(awk '/nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)
-        printf "  %b当前系统 DNS:%b %s\n\n" "$CYAN" "$NC" "${cur_dns:-无}"
-
-        menu_single 1 "设置为国际公共 DNS (Cloudflare 1.1.1.1 + Google 8.8.8.8)"
-        menu_single 2 "设置为国内主流 DNS (阿里 223.5.5.5 + 腾讯 119.29.29.29)"
-        menu_single 3 "自定义输入 DNS IP"
-        menu_single 4 "还原修改前的 DNS 备份"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice dns_opt "> 请选择操作 [0-4]: "
+        printf "  %b当前 DNS:%b %s\n\n" "$CYAN" "$NC" "${cur_dns:-无}"
+        menu_single 1 "国际 DNS (1.1.1.1 + 8.8.8.8)"
+        menu_single 2 "国内 DNS (223.5.5.5 + 119.29.29.29)"
+        menu_single 3 "自定义 DNS"
+        menu_single 4 "还原备份"
+        menu_single 0 "返回"
+        _read_menu_choice dns_opt "> 选择 [0-4]: "
         case "$dns_opt" in
             1) _apply_dns "1.1.1.1" "8.8.8.8"; pause_for_enter ;;
             2) _apply_dns "223.5.5.5" "119.29.29.29"; pause_for_enter ;;
             3)
                 local d1 d2
-                printf '\n'
-                read -rp "  请输入首选 DNS (IPv4): " d1
-                read -rp "  请输入备选 DNS (IPv4, 可留空): " d2
+                read -rp "  首选 DNS: " d1; read -rp "  备选 DNS (可空): " d2
                 d1="${d1// /}"; d2="${d2// /}"
-                [ -n "$d1" ] || continue
-                [ -n "$d2" ] || d2="$d1"
-                _apply_dns "$d1" "$d2"
-                pause_for_enter
-                ;;
+                [ -n "$d1" ] && { _apply_dns "$d1" "${d2:-$d1}"; pause_for_enter; } ;;
             4)
                 if [ -f /etc/resolv.conf.sbx_bak ]; then
                     chattr -i /etc/resolv.conf 2>/dev/null || true
                     cp -pf /etc/resolv.conf.sbx_bak /etc/resolv.conf
-                    printf '\n%b[成功] 已从备份还原 /etc/resolv.conf！%b\n' "$GREEN" "$NC"
+                    printf '%b[OK] 已还原 DNS%b\n' "$GREEN" "$NC"
                 else
-                    printf '\n%b[!] 未找到历史备份文件。%b\n' "$YELLOW" "$NC"
+                    printf '%b[!] 无备份%b\n' "$YELLOW" "$NC"
                 fi
-                pause_for_enter
-                ;;
+                pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
 
-# ---------- TCP 参数调优与 BBR ----------
 manage_tcp_bbr() {
     while true; do
-        menu_header "TCP 调优与 BBR 拥塞控制"
-        local cur_cc cur_qdisc
+        menu_header "TCP 调优与 BBR"
+        local cur_cc cur_qdisc st
         cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
         cur_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
-
-        printf "  %b当前拥塞算法:%b %s\n" "$CYAN" "$NC" "$cur_cc"
-        printf "  %b当前队列规则:%b %s\n" "$CYAN" "$NC" "$cur_qdisc"
-        if [ -f "$TCP_SYSCTL_CONF" ]; then
-            printf "  %bSBX 调优状态:%b %b已应用%b\n\n" "$CYAN" "$NC" "$GREEN" "$NC"
-        else
-            printf "  %bSBX 调优状态:%b %b未应用%b\n\n" "$CYAN" "$NC" "$DIM" "$NC"
-        fi
-
-        menu_single 1 "一键启用 原生 BBR + FQ 加速"
-        menu_single 2 "一键应用 TCP 缓冲区与大并发高吞吐调优"
-        menu_single 3 "查看当前内核调优参数文件"
-        menu_single 4 "还原为系统默认 TCP 参数"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice tcp_opt "> 请选择操作 [0-4]: "
+        [ -f "$TCP_SYSCTL_CONF" ] && st="${GREEN}已调优${NC}" || st="${DIM}默认${NC}"
+        printf "  %b拥塞算法:%b %s  |  %b队列:%b %s  |  %b状态:%b %b\n\n" "$CYAN" "$NC" "$cur_cc" "$CYAN" "$NC" "$cur_qdisc" "$CYAN" "$NC" "$st"
+        menu_single 1 "开启原生 BBR + FQ"
+        menu_single 2 "应用高吞吐并发调优 (含 BBR)"
+        menu_single 3 "查看调优参数"
+        menu_single 4 "恢复默认参数"
+        menu_single 0 "返回"
+        _read_menu_choice tcp_opt "> 选择 [0-4]: "
         case "$tcp_opt" in
             1)
-                if confirm_action "启用 Linux 原生 BBR 拥塞控制？"; then
-                    modprobe tcp_bbr 2>/dev/null || true
-                    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-                    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-                    # 持久化
-                    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
-                    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
-                    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-                    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-                    printf '\n%b[成功] 原生 BBR + FQ 已成功启用并持久化！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                confirm_action "启用原生 BBR + FQ？" || continue
+                modprobe tcp_bbr 2>/dev/null || true
+                sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+                sed -i '/net.core.default_qdisc/d;/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+                printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' >> /etc/sysctl.conf
+                printf '%b[OK] BBR + FQ 已启用%b\n' "$GREEN" "$NC"; pause_for_enter ;;
             2)
-                if confirm_action "应用 TCP 高并发、低延迟与大缓冲区参数？"; then
-                    cat > "$TCP_SYSCTL_CONF" <<'EOF'
-# SBX 网络性能优化配置
+                confirm_action "应用 TCP 高吞吐并发参数？" || continue
+                cat > "$TCP_SYSCTL_CONF" <<'EOF'
 fs.file-max = 1000000
 fs.inotify.max_user_instances = 8192
 net.core.default_qdisc = fq
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
-net.core.rmem_default = 65536
-net.core.wmem_default = 65536
 net.core.somaxconn = 32768
 net.core.netdev_max_backlog = 32768
 net.ipv4.tcp_congestion_control = bbr
@@ -635,191 +419,98 @@ net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_syncookies = 1
 EOF
-                    sysctl -p "$TCP_SYSCTL_CONF" >/dev/null 2>&1 || true
-                    printf '\n%b[成功] TCP 高吞吐调优参数已应用！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
-            3)
-                if [ -f "$TCP_SYSCTL_CONF" ]; then
-                    printf '\n%b--- [%s] 内容 ---%b\n' "$CYAN" "$TCP_SYSCTL_CONF" "$NC"
-                    cat "$TCP_SYSCTL_CONF"
-                else
-                    printf '\n%b[!] 尚未生成调优参数文件。%b\n' "$YELLOW" "$NC"
-                fi
-                pause_for_enter
-                ;;
+                sysctl -p "$TCP_SYSCTL_CONF" >/dev/null 2>&1 || true
+                printf '%b[OK] 调优参数已生效%b\n' "$GREEN" "$NC"; pause_for_enter ;;
+            3) [ -f "$TCP_SYSCTL_CONF" ] && cat "$TCP_SYSCTL_CONF" || printf '%b[!] 未生成调优文件%b\n' "$YELLOW" "$NC"; pause_for_enter ;;
             4)
-                if confirm_action "移除 SBX 调优文件并重置为系统默认配置？"; then
-                    rm -f "$TCP_SYSCTL_CONF"
-                    sysctl --system >/dev/null 2>&1 || true
-                    printf '\n%b[成功] 已恢复系统默认参数。%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                confirm_action "移除 SBX 调优参数？" || continue
+                rm -f "$TCP_SYSCTL_CONF"; sysctl --system >/dev/null 2>&1 || true
+                printf '%b[OK] 已恢复默认%b\n' "$GREEN" "$NC"; pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
 
-# ---------- BestTrace 回程线路路由测试 ----------
-check_return_route() {
-    menu_header "BestTrace 回程线路路由测试"
-    printf '  %b测试国内四大骨干网 (电信/联通/移动/教育网) 的回程路由与线路质量...%b\n\n' "$CYAN" "$NC"
-    if ! confirm_action "从 besttrace.sh 下载并执行回程路由测试？" "y"; then return 0; fi
-
-    printf '\n%b>>> 正在启动 BestTrace 回程测试引擎...%b\n\n' "$CYAN" "$NC"
-    local bt_tmp
-    bt_tmp=$(mktemp /tmp/sbx_bt_XXXXXX) || { printf '%b[错误] 无法创建临时文件。%b\n' "$RED" "$NC"; pause_for_enter; return; }
-    if wget -qO- https://besttrace.sh -O "$bt_tmp" 2>/dev/null || curl -fsSL --connect-timeout 10 https://besttrace.sh -o "$bt_tmp"; then
-        if grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$bt_tmp"; then
-            bash "$bt_tmp"
-        else
-            printf '%b[错误] 脚本内容校验失败。%b\n' "$RED" "$NC"
-        fi
+_run_remote_script() {
+    local title="$1" url="$2"
+    menu_header "$title"
+    confirm_action "下载并运行 ${url}？" "y" || return 0
+    local tmp
+    tmp=$(mktemp /tmp/sbx_ext_XXXXXX) || return 1
+    if curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp" 2>/dev/null || wget -qO "$tmp" "$url" 2>/dev/null; then
+        grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$tmp" && bash "$tmp" || printf '%b[!] 脚本校验失败%b\n' "$RED" "$NC"
     else
-        printf '%b[错误] 下载 besttrace.sh 失败，请检查网络连通性。%b\n' "$RED" "$NC"
+        printf '%b[!] 下载失败%b\n' "$RED" "$NC"
     fi
-    rm -f "$bt_tmp"
+    rm -f "$tmp"
     pause_for_enter
 }
 
-# ---------- 流媒体与 IP 质量检测 ----------
-check_media_unlock() {
-    menu_header "流媒体解锁与 IP 质量检测"
-    printf '  %b启动权威流媒体与 IP 解锁检测引擎 (Check.Place)...%b\n\n' "$CYAN" "$NC"
-    if ! confirm_action "下载并执行流媒体解锁测试脚本？" "y"; then return 0; fi
+check_return_route() { _run_remote_script "BestTrace 回程路由测试" "https://besttrace.sh"; }
+check_media_unlock() { _run_remote_script "流媒体与 IP 质量检测" "https://Check.Place"; }
 
-    printf '\n%b>>> 正在启动检测引擎...%b\n\n' "$CYAN" "$NC"
-    local media_tmp
-    media_tmp=$(mktemp /tmp/sbx_media_XXXXXX) || { printf '%b[错误] 无法创建临时文件。%b\n' "$RED" "$NC"; pause_for_enter; return; }
-    if curl -fsSL --connect-timeout 10 --max-time 60 https://Check.Place -o "$media_tmp" 2>/dev/null || wget -qO- https://Check.Place -O "$media_tmp" 2>/dev/null; then
-        if grep -Eq '^#!/|(^|[[:space:]])(bash|sh)[[:space:]]' "$media_tmp"; then
-            bash "$media_tmp"
-        else
-            printf '%b[错误] 检测脚本内容校验失败。%b\n' "$RED" "$NC"
-        fi
-    else
-        printf '%b[错误] 下载检测脚本失败，请检查网络出墙连通性。%b\n' "$RED" "$NC"
-    fi
-    rm -f "$media_tmp"
-    pause_for_enter
-}
-
-# ---------- UFW 防火墙管理 ----------
 manage_ufw() {
     while true; do
-        menu_header "UFW 防火墙端口管理"
+        menu_header "UFW 防火墙管理"
         if ! command -v ufw >/dev/null 2>&1; then
-            printf '  %b系统尚未安装 UFW 防火墙。%b\n\n' "$YELLOW" "$NC"
-            menu_single 1 "一键安装 UFW 防火墙"
-            menu_single 0 "返回主菜单"
+            printf '  %bUFW 未安装%b\n\n' "$YELLOW" "$NC"
+            menu_single 1 "安装 UFW"
+            menu_single 0 "返回"
             _read_menu_choice ins_opt
-            if [ "$ins_opt" = "1" ]; then
-                case "$OS_FAMILY" in
-                    debian) apt-get update -y && apt-get install -y ufw ;;
-                    redhat) dnf install -y ufw 2>/dev/null || yum install -y ufw ;;
-                    alpine) apk add ufw ;;
-                    arch) pacman -S --noconfirm ufw ;;
-                esac
-                pause_for_enter
-            else
-                return 0
-            fi
-            continue
+            [ "$ins_opt" = "1" ] || return 0
+            case "$OS_FAMILY" in
+                debian) apt-get update -y && apt-get install -y ufw ;;
+                redhat) dnf install -y ufw 2>/dev/null || yum install -y ufw ;;
+                alpine) apk add ufw ;;
+                arch)   pacman -S --noconfirm ufw ;;
+            esac
+            pause_for_enter; continue
         fi
-
-        local ufw_status
-        ufw_status=$(ufw status 2>/dev/null | head -1 | awk '{print $2}')
-        printf "  %b当前 UFW 状态:%b " "$CYAN" "$NC"
-        if [ "$ufw_status" = "active" ]; then
-            printf "%b已激活 (运行中)%b\n\n" "$GREEN" "$NC"
-        else
-            printf "%b未激活 (已关闭)%b\n\n" "$RED" "$NC"
-        fi
-
-        menu_single 1 "查看当前规则列表与端口"
-        menu_single 2 "放行指定端口 (TCP / UDP)"
-        menu_single 3 "删除指定编号规则"
-        menu_single 4 "开启防火墙 (自动放行 SSH 端口防失联)"
-        menu_single 5 "彻底关闭防火墙"
-        menu_single 6 "一键仅放行当前正在监听的公开端口"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice ufw_opt "> 请选择操作 [0-6]: "
+        local st
+        st=$(ufw status 2>/dev/null | head -1 | awk '{print $2}')
+        [ "$st" = "active" ] && st="${GREEN}已开启${NC}" || st="${RED}已关闭${NC}"
+        printf "  %b状态:%b %b\n\n" "$CYAN" "$NC" "$st"
+        menu_pair 1 "查看规则" 2 "放行端口"
+        menu_pair 3 "删除规则" 4 "开启防火墙"
+        menu_pair 5 "关闭防火墙" 6 "放行所有监听端口"
+        menu_single 0 "返回"
+        _read_menu_choice ufw_opt "> 选择 [0-6]: "
         case "$ufw_opt" in
-            1)
-                printf '\n%b>>> UFW 当前规则列表：%b\n' "$CYAN" "$NC"
-                ufw status numbered
-                pause_for_enter
-                ;;
+            1) printf '\n'; ufw status numbered; pause_for_enter ;;
             2)
                 local port proto
-                printf '\n'
-                read -rp "  请输入要放行的端口: " port
-                port="${port// /}"
-                [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
-                    printf '%b[!] 端口号不合法。%b\n' "$RED" "$NC"; pause_for_enter; continue;
-                }
-                read -rp "  请输入协议 (tcp/udp，直接回车代表两者全部放行): " proto
-                proto="${proto// /}"
-                if [ -n "$proto" ]; then
-                    ufw allow "${port}/${proto}"
-                else
-                    ufw allow "$port"
-                fi
-                printf '%b[成功] 端口 %s 已放行！%b\n' "$GREEN" "$port" "$NC"
-                pause_for_enter
-                ;;
+                read -rp "  放行端口: " port; port="${port// /}"
+                [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || { printf '%b[!] 端口无效%b\n' "$RED" "$NC"; pause_for_enter; continue; }
+                read -rp "  协议 (tcp/udp, 回车全放行): " proto; proto="${proto// /}"
+                [ -n "$proto" ] && ufw allow "${port}/${proto}" || ufw allow "$port"
+                pause_for_enter ;;
             3)
-                printf '\n'
                 ufw status numbered
                 local r_num
-                read -rp "  请输入要删除的【规则编号】: " r_num
-                r_num="${r_num// /}"
-                [[ "$r_num" =~ ^[0-9]+$ ]] || { printf '%b[!] 编号必须为纯数字。%b\n' "$RED" "$NC"; pause_for_enter; continue; }
-                ufw --force delete "$r_num"
-                printf '%b[成功] 规则 %s 已删除！%b\n' "$GREEN" "$r_num" "$NC"
-                pause_for_enter
-                ;;
+                read -rp "  删除规则编号: " r_num; r_num="${r_num// /}"
+                [[ "$r_num" =~ ^[0-9]+$ ]] && ufw --force delete "$r_num"
+                pause_for_enter ;;
             4)
-                # 关键防失联：探测当前 ssh 端口
                 local ssh_port
                 ssh_port=$(ss -tlnp 2>/dev/null | grep -w sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
-                [ -n "$ssh_port" ] || ssh_port=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1)
+                [ -n "$ssh_port" ] || ssh_port=$(awk '/^Port /{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
                 ssh_port="${ssh_port:-22}"
-
-                if confirm_action "启用 UFW 防火墙？（将自动放行 SSH 端口: ${ssh_port} 保证不断连）" "y"; then
-                    ufw allow "$ssh_port"/tcp >/dev/null 2>&1 || true
+                if confirm_action "启用 UFW (自动放行 SSH 端口 ${ssh_port})？" "y"; then
+                    ufw allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
                     ufw default deny incoming >/dev/null 2>&1 || true
                     ufw default allow outgoing >/dev/null 2>&1 || true
                     ufw --force enable
-                    printf '%b[成功] UFW 防火墙已成功开启！%b\n' "$GREEN" "$NC"
                     pause_for_enter
-                fi
-                ;;
-            5)
-                if confirm_action "关闭 UFW 防火墙？"; then
-                    ufw disable
-                    printf '%b[成功] UFW 防火墙已关闭。%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                fi ;;
+            5) confirm_action "关闭 UFW？" && { ufw disable; pause_for_enter; } ;;
             6)
-                if confirm_action "自动放行当前本机所有已监听的公开端口？"; then
-                    local p
-                    for p in $(ss -tlnu 2>/dev/null | awk 'NR>1{print $5}' | awk -F: '{print $NF}' | sort -nu); do
-                        [[ "$p" =~ ^[0-9]+$ ]] || continue
-                        ufw allow "$p" >/dev/null 2>&1 || true
-                        printf '  放行端口: %s\n' "$p"
-                    done
-                    printf '%b[成功] 所有在听端口放行完成！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                confirm_action "放行本机所有监听端口？" || continue
+                local p
+                for p in $(ss -tlnu 2>/dev/null | awk 'NR>1{print $5}' | awk -F: '{print $NF}' | sort -nu); do
+                    [[ "$p" =~ ^[0-9]+$ ]] && ufw allow "$p" >/dev/null 2>&1 && printf '  + 端口 %s\n' "$p"
+                done
+                pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
@@ -833,50 +524,35 @@ ensure_dirs() {
 
 sbx_service_status() {
     if [ ! -f "$SERVICE_SYSTEMD" ] && [ ! -f "$SERVICE_OPENRC" ]; then
-        printf '%b未部署%b' "$DIM" "$NC"
-        return 0
+        printf '%b未部署%b' "$DIM" "$NC"; return 0
     fi
     if [ "$INIT_SYS" = "systemd" ]; then
-        if systemctl is-active --quiet sbx.service 2>/dev/null; then
-            printf '%b运行中%b' "$GREEN" "$NC"
-        else
-            printf '%b已停止%b' "$RED" "$NC"
-        fi
+        systemctl is-active --quiet sbx.service 2>/dev/null && printf '%b运行中%b' "$GREEN" "$NC" || printf '%b已停止%b' "$RED" "$NC"
     elif [ "$INIT_SYS" = "openrc" ]; then
-        if rc-service sbx status 2>/dev/null | grep -q 'started'; then
-            printf '%b运行中%b' "$GREEN" "$NC"
-        else
-            printf '%b已停止%b' "$RED" "$NC"
-        fi
+        rc-service sbx status 2>/dev/null | grep -q 'started' && printf '%b运行中%b' "$GREEN" "$NC" || printf '%b已停止%b' "$RED" "$NC"
     else
         printf '%b未知%b' "$YELLOW" "$NC"
     fi
 }
 
 install_singbox_bin() {
-    if [ -x "$BIN_FILE" ]; then
-        printf 'Sing-box 核心已存在: %s\n' "$("$BIN_FILE" version 2>/dev/null | head -1)"
-        return 0
-    fi
-
-    printf '%b>>> 正在安装 Sing-box 官方最新核心...%b\n' "$CYAN" "$NC"
+    [ -x "$BIN_FILE" ] && return 0
+    printf '%b>>> 安装 Sing-box 核心...%b\n' "$CYAN" "$NC"
     local arch uname_m
     uname_m=$(uname -m)
     case "$uname_m" in
         x86_64|amd64) arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
         armv7*) arch="armv7" ;;
-        *) printf '%b[!] 不支持的 CPU 架构: %s%b\n' "$RED" "$uname_m" "$NC"; return 1 ;;
+        *) printf '%b[!] 不支持的架构: %s%b\n' "$RED" "$uname_m" "$NC"; return 1 ;;
     esac
 
-    local tag url tmp_dir
+    local tag url tmp_dir ver
     tag=$(curl -sL --connect-timeout 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | cut -d'"' -f4)
-    [ -n "$tag" ] || tag="v1.10.7"
-    local ver="${tag#v}"
-
+    [ -n "$tag" ] || tag="v1.11.4"
+    ver="${tag#v}"
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-linux-${arch}.tar.gz"
     tmp_dir=$(mktemp -d /tmp/sbx_core_XXXXXX)
-    printf '正在下载 %s ...\n' "$url"
     if curl -fsSL --connect-timeout 10 -o "${tmp_dir}/sb.tar.gz" "$url"; then
         tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
         local found_bin
@@ -884,12 +560,12 @@ install_singbox_bin() {
         if [ -n "$found_bin" ]; then
             install -m 755 "$found_bin" "$BIN_FILE"
             rm -rf "$tmp_dir"
-            printf '%b[成功] Sing-box 核心安装完成: %s%b\n' "$GREEN" "$("$BIN_FILE" version | head -1)" "$NC"
+            printf '%b[OK] Sing-box 已就绪: %s%b\n' "$GREEN" "$("$BIN_FILE" version | head -1)" "$NC"
             return 0
         fi
     fi
     rm -rf "$tmp_dir"
-    printf '%b[错误] 下载或安装 Sing-box 核心失败。%b\n' "$RED" "$NC"
+    printf '%b[!] 下载或安装 Sing-box 失败%b\n' "$RED" "$NC"
     return 1
 }
 
@@ -897,8 +573,7 @@ deploy_sbx_service() {
     if [ "$INIT_SYS" = "systemd" ]; then
         cat > "$SERVICE_SYSTEMD" <<EOF
 [Unit]
-Description=Sing-box Service (Managed by SBX)
-Documentation=https://sing-box.sagernet.org
+Description=Sing-box Service (SBX)
 After=network.target nss-lookup.target
 
 [Service]
@@ -925,11 +600,7 @@ command_background="yes"
 pidfile="/run/sbx.pid"
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
-
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; after firewall; }
 EOF
         chmod 755 "$SERVICE_OPENRC"
         rc-update add sbx default >/dev/null 2>&1 || true
@@ -941,189 +612,117 @@ init_sbx_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" <<'EOF'
 {
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
+  "log": { "level": "warn", "timestamp": true },
   "inbounds": [],
   "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
   ],
   "route": {
     "auto_detect_interface": true,
-    "rules": [
-      {
-        "action": "sniff"
-      }
-    ],
+    "rules": [{ "action": "sniff" }],
     "final": "direct"
   }
 }
 EOF
     fi
-    if [ ! -f "$STATE_FILE" ]; then
-        echo '{"format": 5, "nodes": {}}' > "$STATE_FILE"
-    fi
+    [ -f "$STATE_FILE" ] || echo '{"format": 5, "nodes": {}}' > "$STATE_FILE"
 }
 
 sbx_backup_config() {
     ensure_dirs
     [ -f "$CONFIG_FILE" ] || return 0
-    local ts
-    ts=$(date +"%Y%m%d_%H%M%S")
-    cp -pf "$CONFIG_FILE" "${BACKUP_DIR}/config_${ts}.json" 2>/dev/null || true
-    # 最多保留 10 个备份
+    cp -pf "$CONFIG_FILE" "${BACKUP_DIR}/config_$(date +'%Y%m%d_%H%M%S').json" 2>/dev/null || true
     local old_baks
     old_baks=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | tail -n +11)
-    if [ -n "$old_baks" ]; then
-        rm -f $old_baks 2>/dev/null || true
-    fi
+    [ -n "$old_baks" ] && rm -f $old_baks 2>/dev/null || true
 }
 
 sbx_check_config() {
-    if [ ! -x "$BIN_FILE" ]; then return 0; fi
+    [ -x "$BIN_FILE" ] || return 0
     "$BIN_FILE" check -c "$CONFIG_FILE" >/dev/null 2>&1
 }
 
-# 统一安全写入与核心预检函数：
-# 1. 只有 candidate 通过 sing-box check，才允许覆盖 CONFIG_FILE
-# 2. 预检不通过时，打印完整错误、清除临时文件，原配置 100% 不动
-# 3. 覆盖后启动，若服务异常拉起失败，自动回滚上一次备份
 sbx_apply_config_safe() {
     local candidate="$1"
     if [ ! -s "$candidate" ]; then
-        printf '%b[错误] 待应用配置文件为空。%b\n' "$RED" "$NC"
+        printf '%b[!] 待写入配置为空%b\n' "$RED" "$NC"
         rm -f "$candidate"
         return 1
     fi
-
-    # 1. 核心预检
     local check_err
     if ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
-        printf '\n%b[核心预检失败] 节点配置未通过 Sing-box 核心校验，已拒绝写入，原配置未做任何修改：%b\n' "$RED$BOLD" "$NC"
-        printf '%b%s%b\n' "$YELLOW" "$check_err" "$NC"
+        printf '\n%b[核心预检失败] 配置未通过 Sing-box 校验，原配置未改动:%b\n%b%s%b\n' "$RED$BOLD" "$NC" "$YELLOW" "$check_err" "$NC"
         rm -f "$candidate"
         return 1
     fi
-
-    # 2. 备份原配置
     sbx_backup_config
-
-    # 3. 原子替换
     mv -f "$candidate" "$CONFIG_FILE"
-
-    # 4. 重启服务
     sbx_svc_action restart >/dev/null 2>&1 || true
-
-    # 5. 服务拉起校验（若拉起失败，自动回滚最近一次备份）
     sleep 0.5
     if [ "$INIT_SYS" = "systemd" ] && ! systemctl is-active --quiet sbx.service 2>/dev/null; then
         local latest_bak
         latest_bak=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | head -1)
         if [ -n "$latest_bak" ]; then
-            printf '\n%b[警告] 服务启动异常，正在自动回滚至上一版本配置...%b\n' "$RED" "$NC"
+            printf '\n%b[!] 服务启动异常，已自动回滚至上一版本%b\n' "$RED" "$NC"
             cp -pf "$latest_bak" "$CONFIG_FILE"
             sbx_svc_action restart >/dev/null 2>&1 || true
         fi
         return 1
     fi
-
     return 0
 }
 
 sbx_svc_action() {
     local act="$1"
-    if [ "$INIT_SYS" = "systemd" ]; then
-        systemctl "$act" sbx.service
-    elif [ "$INIT_SYS" = "openrc" ]; then
-        rc-service sbx "$act"
-    fi
+    [ "$INIT_SYS" = "systemd" ] && systemctl "$act" sbx.service
+    [ "$INIT_SYS" = "openrc" ] && rc-service sbx "$act"
 }
 
 manage_service() {
     while true; do
-        menu_header "Sing-box 核心与服务维护"
-        printf "  %b服务运行状态:%b  %b\n" "$CYAN" "$NC" "$(sbx_service_status)"
-        printf "  %b配置文件路径:%b  %s\n" "$CYAN" "$NC" "$CONFIG_FILE"
-        printf "  %b核心程序路径:%b  %s\n\n" "$CYAN" "$NC" "$BIN_FILE"
+        menu_header "Sing-box 核心与服务"
+        local ver
+        ver=$([ -x "$BIN_FILE" ] && "$BIN_FILE" version 2>/dev/null | head -1 | awk '{print $3}' || echo "未安装")
+        printf "  %b状态:%b %b  |  %b核心:%b %s\n" "$CYAN" "$NC" "$(sbx_service_status)" "$CYAN" "$NC" "$ver"
+        printf "  %b配置:%b %s\n\n" "$CYAN" "$NC" "$CONFIG_FILE"
 
-        menu_single 1 "启动 sing-box (sbx) 服务"
-        menu_single 2 "停止 sing-box (sbx) 服务"
-        menu_single 3 "重启 sing-box (sbx) 服务"
-        menu_single 4 "查看实时运行日志"
-        menu_single 5 "校验当前配置文件完整性"
-        menu_single 6 "从历史备份中回滚配置"
-        menu_single 7 "更新 / 重装 Sing-box 核心程序"
-        menu_single 0 "返回主菜单"
+        menu_pair 1 "启动服务" 2 "停止服务"
+        menu_pair 3 "重启服务" 4 "查看日志"
+        menu_pair 5 "校验配置" 6 "回滚备份"
+        menu_single 7 "更新 / 重装核心"
+        menu_single 0 "返回"
 
-        _read_menu_choice svc_opt "> 请选择操作 [0-7]: "
+        _read_menu_choice svc_opt "> 选择 [0-7]: "
         case "$svc_opt" in
             1) sbx_svc_action start; pause_for_enter ;;
             2) sbx_svc_action stop; pause_for_enter ;;
             3) sbx_svc_action restart; pause_for_enter ;;
             4)
-                printf '\n%b>>> 最近 30 行服务日志 (Ctrl+C 退出)：%b\n' "$CYAN" "$NC"
-                if [ "$INIT_SYS" = "systemd" ]; then
-                    journalctl -u sbx.service -n 30 --no-pager
-                else
-                    tail -n 30 "$LOG_FILE" 2>/dev/null || echo "暂无日志。"
-                fi
-                pause_for_enter
-                ;;
+                printf '\n'
+                [ "$INIT_SYS" = "systemd" ] && journalctl -u sbx.service -n 30 --no-pager || tail -n 30 "$LOG_FILE" 2>/dev/null
+                pause_for_enter ;;
             5)
                 printf '\n'
-                if "$BIN_FILE" check -c "$CONFIG_FILE"; then
-                    printf '\n%b[成功] 配置文件校验完全通过！%b\n' "$GREEN" "$NC"
-                else
-                    printf '\n%b[错误] 配置文件存在语法或参数错误！%b\n' "$RED" "$NC"
-                fi
-                pause_for_enter
-                ;;
+                "$BIN_FILE" check -c "$CONFIG_FILE" && printf '%b[OK] 配置校验通过%b\n' "$GREEN" "$NC" || printf '%b[!] 配置存在错误%b\n' "$RED" "$NC"
+                pause_for_enter ;;
             6)
-                local baks choice i=1 b_list=()
-                while IFS= read -r f; do
-                    [ -n "$f" ] || continue
-                    b_list+=("$f")
-                done < <(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null)
-
-                if [ ${#b_list[@]} -eq 0 ]; then
-                    printf '\n%b[!] 暂无可用历史备份。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter
-                    continue
-                fi
-
-                printf '\n%b历史备份列表：%b\n' "$CYAN" "$NC"
-                for f in "${b_list[@]}"; do
-                    printf "  %b%d)%b %s\n" "$GREEN" "$i" "$NC" "$(basename "$f")"
-                    i=$((i + 1))
-                done
+                local choice i=1 b_list=() f
+                while IFS= read -r f; do [ -n "$f" ] && b_list+=("$f"); done < <(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null)
+                [ ${#b_list[@]} -gt 0 ] || { printf '\n%b[!] 暂无备份%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
                 printf '\n'
-                read -rp "  请选择要恢复的备份编号: " choice
-                choice="${choice// /}"
+                for f in "${b_list[@]}"; do printf "  %b%d.%b %s\n" "$GREEN" "$i" "$NC" "$(basename "$f")"; i=$((i + 1)); done
+                read -rp "  选择备份编号: " choice; choice="${choice// /}"
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#b_list[@]}" ]; then
                     local target="${b_list[$((choice - 1))]}"
-                    if confirm_action "从 $(basename "$target") 恢复配置？"; then
+                    if confirm_action "恢复 $(basename "$target")？"; then
                         cp -pf "$target" "$CONFIG_FILE"
                         sbx_svc_action restart >/dev/null 2>&1 || true
-                        printf '%b[成功] 配置已还原并重启服务！%b\n' "$GREEN" "$NC"
-                        pause_for_enter
+                        printf '%b[OK] 已恢复并重启%b\n' "$GREEN" "$NC"; pause_for_enter
                     fi
-                fi
-                ;;
-            7)
-                rm -f "$BIN_FILE"
-                install_singbox_bin
-                pause_for_enter
-                ;;
+                fi ;;
+            7) rm -f "$BIN_FILE"; install_singbox_bin; pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
@@ -1132,58 +731,56 @@ manage_service() {
 
 _find_available_port() {
     local p="${1:-443}"
-    while true; do
-        if ! ss -tlnu 2>/dev/null | awk '{print $5}' | awk -F: '{print $NF}' | grep -wq "$p"; then
-            echo "$p"
-            return 0
-        fi
+    while [ "$p" -le 65535 ]; do
+        ss -tlnu 2>/dev/null | awk '{print $5}' | awk -F: '{print $NF}' | grep -wq "$p" || { echo "$p"; return 0; }
         p=$((p + 1))
-        [ "$p" -le 65535 ] || break
     done
     echo "4433"
 }
 
 _generate_reality_keys() {
-    local out
+    local out priv pub
     out=$("$BIN_FILE" generate reality-keypair 2>/dev/null)
-    local priv pub
     priv=$(echo "$out" | awk '/PrivateKey:/{print $2}' | tr -d '\r')
     pub=$(echo "$out" | awk '/PublicKey:/{print $2}' | tr -d '\r')
     printf '%s|%s' "$priv" "$pub"
 }
 
+_is_node_warp() {
+    local tag="$1"
+    [ -f "$STATE_FILE" ] || return 1
+    jq -e --arg t "$tag" '(.warp_nodes // []) | index($t) != null' "$STATE_FILE" >/dev/null 2>&1
+}
+
 add_reality_node() {
-    menu_header "搭建 / 添加 VLESS-Reality 节点"
+    menu_header "添加 VLESS-Reality 节点"
     acquire_lock || return 1
     install_singbox_bin || return 1
     init_sbx_config
     deploy_sbx_service
 
-    printf '  %b[1/5] 设置节点端口%b\n' "$CYAN" "$NC"
-    local rec_port port
+    local rec_port port sni sni_opt name
     rec_port=$(_find_available_port 443)
-    read -rp "  请输入监听端口 [默认 ${rec_port}]: " port
-    port="${port// /}"
-    port="${port:-$rec_port}"
+    read -rp "  1. 监听端口 [默认 ${rec_port}]: " port
+    port="${port// /}"; port="${port:-$rec_port}"
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
-        printf '%b[!] 端口号不合法。%b\n' "$RED" "$NC"; pause_for_enter; return 1;
+        printf '%b[!] 端口无效%b\n' "$RED" "$NC"; pause_for_enter; return 1;
     }
 
-    printf '\n  %b[2/5] 设置伪装域名 (SNI)%b\n' "$CYAN" "$NC"
-    printf '  常用推荐: 1) addons.mozilla.org  2) gateway.icloud.com  3) www.microsoft.com\n'
-    local sni sni_opt
-    read -rp "  请选择或输入 SNI [直接回车默认 addons.mozilla.org]: " sni_opt
+    printf '  2. 伪装域名: 1) addons.mozilla.org  2) gateway.icloud.com  3) www.microsoft.com\n'
+    read -rp "     选择或输入 SNI [默认 1]: " sni_opt
     sni_opt="${sni_opt// /}"
     case "$sni_opt" in
-        1) sni="addons.mozilla.org" ;;
-        2) sni="gateway.icloud.com" ;;
-        3) sni="www.microsoft.com" ;;
-        "") sni="addons.mozilla.org" ;;
-        *) sni="$sni_opt" ;;
+        1|"") sni="addons.mozilla.org" ;;
+        2)    sni="gateway.icloud.com" ;;
+        3)    sni="www.microsoft.com" ;;
+        *)    sni="$sni_opt" ;;
     esac
 
-    printf '\n  %b[3/5] 生成安全密钥与认证凭据...%b\n' "$CYAN" "$NC"
-    local uuid keys priv_key pub_key short_id tag
+    read -rp "  3. 节点备注 [默认 Reality-${port}]: " name
+    name="${name// /}"; name="${name:-Reality-${port}}"
+
+    local uuid keys priv_key pub_key short_id tag tmp_conf tmp_state
     uuid=$("$BIN_FILE" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
     keys=$(_generate_reality_keys)
     priv_key=$(echo "$keys" | cut -d'|' -f1)
@@ -1191,112 +788,69 @@ add_reality_node() {
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "1a2b3c4d5e6f7a8b")
     tag="vless-reality-${port}"
 
-    printf '\n  %b[4/5] 设置节点备注名称%b\n' "$CYAN" "$NC"
-    local name
-    read -rp "  请输入节点备注名称 [默认 Reality-${port}]: " name
-    name="${name// /}"
-    name="${name:-Reality-${port}}"
-
-    # 写入配置并交由核心预检引擎安全应用
-    local tmp_conf
     tmp_conf=$(mktemp /tmp/sbx_conf_XXXXXX)
-    jq --arg tag "$tag" \
-       --argjson port "$port" \
-       --arg uuid "$uuid" \
-       --arg sni "$sni" \
-       --arg priv "$priv_key" \
-       --arg sid "$short_id" \
-       '.inbounds = [.inbounds[] | select(.tag != $tag)] + [{
-          "type": "vless",
-          "tag": $tag,
-          "listen": "::",
-          "listen_port": $port,
-          "tcp_fast_open": true,
-          "users": [{
-            "uuid": $uuid,
-            "flow": "xtls-rprx-vision"
-          }],
-          "tls": {
+    jq --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg priv "$priv_key" --arg sid "$short_id" '
+      .inbounds = [.inbounds[] | select(.tag != $tag)] + [{
+        "type": "vless",
+        "tag": $tag,
+        "listen": "::",
+        "listen_port": $port,
+        "tcp_fast_open": true,
+        "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
+        "tls": {
+          "enabled": true,
+          "server_name": $sni,
+          "reality": {
             "enabled": true,
-            "server_name": $sni,
-            "reality": {
-              "enabled": true,
-              "handshake": {
-                "server": $sni,
-                "server_port": 443
-              },
-              "private_key": $priv,
-              "short_id": [$sid]
-            }
+            "handshake": { "server": $sni, "server_port": 443 },
+            "private_key": $priv,
+            "short_id": [$sid]
           }
-       }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
+        }
+      }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
 
-    if ! sbx_apply_config_safe "$tmp_conf"; then
-        pause_for_enter
-        return 1
-    fi
+    sbx_apply_config_safe "$tmp_conf" || { pause_for_enter; return 1; }
 
-    # 预检通过并应用成功后，持久化元数据
-    local tmp_state
     tmp_state=$(mktemp /tmp/sbx_state_XXXXXX)
-    jq --arg tag "$tag" \
-       --arg name "$name" \
-       --argjson port "$port" \
-       --arg uuid "$uuid" \
-       --arg sni "$sni" \
-       --arg pub "$pub_key" \
-       --arg sid "$short_id" \
-       '.nodes[$tag] = {
-          "name": $name,
-          "port": $port,
-          "uuid": $uuid,
-          "sni": $sni,
-          "pub_key": $pub,
-          "short_id": $sid,
-          "created_at": (now | todate)
-       }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
+    jq --arg tag "$tag" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pub "$pub_key" --arg sid "$short_id" '
+      .nodes[$tag] = {
+        "name": $name, "port": $port, "uuid": $uuid, "sni": $sni,
+        "pub_key": $pub, "short_id": $sid, "created_at": (now | todate)
+      }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
     rm -f "$tmp_state"
 
-    printf '\n%b[5/5] 节点搭建成功！正在生成节点链接...%b\n\n' "$GREEN" "$NC"
+    printf '\n%b[OK] 节点创建成功%b\n' "$GREEN" "$NC"
     _show_node_by_tag "$tag"
     pause_for_enter
 }
 
 _show_node_by_tag() {
-    local tag="$1"
-    local node_data
+    local tag="$1" node_data
     node_data=$(jq -r --arg t "$tag" '.nodes[$t] // empty' "$STATE_FILE" 2>/dev/null)
-    [ -n "$node_data" ] || { printf '%b[!] 找不到该节点数据。%b\n' "$RED" "$NC"; return 1; }
+    [ -n "$node_data" ] || { printf '%b[!] 节点不存在%b\n' "$RED" "$NC"; return 1; }
 
-    local name port uuid sni pub_key short_id ip_data ip
+    local name port uuid sni pub_key short_id ip link route_mode
     name=$(echo "$node_data" | jq -r '.name')
     port=$(echo "$node_data" | jq -r '.port')
     uuid=$(echo "$node_data" | jq -r '.uuid')
     sni=$(echo "$node_data" | jq -r '.sni')
     pub_key=$(echo "$node_data" | jq -r '.pub_key')
     short_id=$(echo "$node_data" | jq -r '.short_id')
+    ip=$(_get_public_ip | cut -d'|' -f1)
+    [ -n "$ip" ] || ip="服务器IP"
+    _is_node_warp "$tag" && route_mode="${YELLOW}指定走 WARP${NC}" || route_mode="${CYAN}默认分流/直连${NC}"
 
-    ip_data=$(_get_public_ip)
-    ip=$(echo "$ip_data" | cut -d'|' -f1)
-    [ -n "$ip" ] || ip="您的服务器公网IP"
-
-    local link
     link="vless://${uuid}@${ip}:${port}?security=reality&sni=${sni}&pbk=${pub_key}&sid=${short_id}&type=tcp&flow=xtls-rprx-vision&fp=chrome#${name}"
 
     print_divider
-    printf "  %b节点名称:%b  %s\n" "$CYAN" "$NC" "$name"
-    printf "  %b协议类型:%b  VLESS-Reality + Vision\n" "$CYAN" "$NC"
-    printf "  %b连接地址:%b  %s:%s\n" "$CYAN" "$NC" "$ip" "$port"
-    printf "  %b用户 UUID:%b %s\n" "$CYAN" "$NC" "$uuid"
-    printf "  %b伪装域名:%b  %s\n" "$CYAN" "$NC" "$sni"
-    printf "  %bPublic Key:%b%s\n" "$CYAN" "$NC" "$pub_key"
-    printf "  %bShort ID:%b  %s\n" "$CYAN" "$NC" "$short_id"
+    printf "  %b名称:%b %s  |  %b端口:%b %s  |  %b出站:%b %b\n" "$CYAN" "$NC" "$name" "$CYAN" "$NC" "$port" "$CYAN" "$NC" "$route_mode"
+    printf "  %b地址:%b %s  |  %bSNI :%b %s\n" "$CYAN" "$NC" "$ip" "$CYAN" "$NC" "$sni"
+    printf "  %bUUID:%b %s\n" "$CYAN" "$NC" "$uuid"
+    printf "  %bPBK :%b %s  |  %bSID:%b %s\n" "$CYAN" "$NC" "$pub_key" "$CYAN" "$NC" "$short_id"
     print_divider
-    printf "  %b分享链接 (直接复制导入客户端):%b\n" "$YELLOW$BOLD" "$NC"
-    printf "  %s\n\n" "$link"
-
+    printf "  %b分享链接:%b\n  %s\n" "$YELLOW$BOLD" "$NC" "$link"
     if command -v qrencode >/dev/null 2>&1; then
-        printf "  %b二维码:%b\n" "$CYAN" "$NC"
+        printf "\n"
         qrencode -t ANSIUTF8 "$link" 2>/dev/null || true
     fi
 }
@@ -1305,19 +859,15 @@ list_reality_nodes() {
     init_sbx_config
     local count
     count=$(jq '.nodes | length' "$STATE_FILE" 2>/dev/null || echo 0)
-    if [ "$count" -eq 0 ]; then
-        printf '\n  %b当前暂无已配置的 Reality 节点。%b\n' "$YELLOW" "$NC"
-        return 1
-    fi
+    [ "$count" -gt 0 ] || { printf '  %b暂无节点%b\n' "$DIM" "$NC"; return 1; }
 
-    local tags=() i=1
+    local i=1 t n p w_badge
     while IFS= read -r t; do
         [ -n "$t" ] || continue
-        tags+=("$t")
-        local n p
         n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
         p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
-        printf "  %b%d.%b %-20s  (端口: %s)\n" "$GREEN" "$i" "$NC" "$n" "$p"
+        _is_node_warp "$t" && w_badge=" ${YELLOW}[WARP]${NC}" || w_badge=""
+        printf "  %b%d.%b %-18s (端口: %s)%b\n" "$GREEN" "$i" "$NC" "$n" "$p" "$w_badge"
         i=$((i + 1))
     done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
 }
@@ -1325,81 +875,62 @@ list_reality_nodes() {
 manage_reality() {
     while true; do
         menu_header "VLESS-Reality 节点管理"
-        printf "  %b当前节点列表:%b\n" "$CYAN" "$NC"
-        list_reality_nodes
+        list_reality_nodes || true
         printf '\n'
+        menu_pair 1 "添加节点" 2 "查看链接/二维码"
+        menu_pair 3 "检测端口状态" 4 "删除节点"
+        menu_single 0 "返回"
 
-        menu_single 1 "快速添加新的 VLESS-Reality 节点"
-        menu_single 2 "查看指定节点链接与二维码"
-        menu_single 3 "测试节点连通性 (本地端口检测)"
-        menu_single 4 "删除节点"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice rel_opt "> 请选择操作 [0-4]: "
+        _read_menu_choice rel_opt "> 选择 [0-4]: "
         case "$rel_opt" in
             1) add_reality_node ;;
             2)
-                local tags=() t
+                local tags=() t idx
                 while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
                 [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
-                printf '\n'
-                read -rp "  请输入要查看的节点编号 [1-${#tags[@]}]: " idx
-                idx="${idx// /}"
+                read -rp "  节点编号 [1-${#tags[@]}]: " idx; idx="${idx// /}"
                 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#tags[@]}" ]; then
-                    printf '\n'
                     _show_node_by_tag "${tags[$((idx - 1))]}"
                     pause_for_enter
-                fi
-                ;;
+                fi ;;
             3)
-                local tags=() t
-                while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
-                [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
-                printf '\n%b正在检测节点端口监听状态...%b\n' "$CYAN" "$NC"
-                for t in "${tags[@]}"; do
-                    local n p
-                    n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
-                    p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
-                    if ss -tln | grep -wq ":$p"; then
-                        printf "  [%s] 端口 %s -> %b正常监听中%b\n" "$n" "$p" "$GREEN" "$NC"
-                    else
-                        printf "  [%s] 端口 %s -> %b未在监听 / 核心未启动%b\n" "$n" "$p" "$RED" "$NC"
-                    fi
-                done
-                pause_for_enter
-                ;;
-            4)
-                local tags=() t
+                local tags=() t n p
                 while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
                 [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
                 printf '\n'
-                read -rp "  请输入要删除的节点编号 [1-${#tags[@]}]: " idx
-                idx="${idx// /}"
+                for t in "${tags[@]}"; do
+                    n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
+                    p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
+                    ss -tln | grep -wq ":$p" && printf "  [%s] :%s -> %b监听中%b\n" "$n" "$p" "$GREEN" "$NC" || printf "  [%s] :%s -> %b未监听%b\n" "$n" "$p" "$RED" "$NC"
+                done
+                pause_for_enter ;;
+            4)
+                local tags=() t idx
+                while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
+                [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
+                read -rp "  删除节点编号 [1-${#tags[@]}]: " idx; idx="${idx// /}"
                 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#tags[@]}" ]; then
-                    local sel_tag="${tags[$((idx - 1))]}"
-                    local sel_name
+                    local sel_tag="${tags[$((idx - 1))]}" sel_name
                     sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
-                    if confirm_action "确认删除节点: ${sel_name}？"; then
+                    if confirm_action "删除节点 ${sel_name}？"; then
                         acquire_lock || continue
-                        # 从 config.json 移除候选并进行安全核心预检
-                        local tmp_c tmp_s
-                        tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
-                        if ! sbx_apply_config_safe "$tmp_c"; then
-                            pause_for_enter
-                            continue
-                        fi
-                        # 预检通过并应用后，同步从 state.json 移除
+                        local tmp_s tmp_c1 tmp_c2
                         tmp_s=$(mktemp /tmp/sbx_s_XXXXXX)
-                        jq --arg tag "$sel_tag" 'del(.nodes[$tag])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        rm -f "$tmp_s"
-                        printf '%b[成功] 节点已删除！%b\n' "$GREEN" "$NC"
+                        jq --arg tag "$sel_tag" 'del(.nodes[$tag]) | .warp_nodes = ([.warp_nodes[]? | select(. != $tag)])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                        tmp_c1=$(mktemp /tmp/sbx_c1_XXXXXX)
+                        tmp_c2=$(mktemp /tmp/sbx_c2_XXXXXX)
+                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c1"
+                        if type _sync_warp_node_rules >/dev/null 2>&1; then
+                            _sync_warp_node_rules "$tmp_c1" "$tmp_c2"
+                            rm -f "$tmp_c1"
+                        else
+                            mv "$tmp_c1" "$tmp_c2"
+                        fi
+                        sbx_apply_config_safe "$tmp_c2" && printf '%b[OK] 节点已删除%b\n' "$GREEN" "$NC"
                         pause_for_enter
                     fi
-                fi
-                ;;
+                fi ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
@@ -1411,104 +942,60 @@ manage_forward() {
     while true; do
         menu_header "TCP / UDP 端口转发"
         init_sbx_config
+        local fwd_rules=() i=1 tag lp dest_ip dest_port
+        while IFS= read -r tag; do [ -n "$tag" ] && fwd_rules+=("$tag"); done < <(jq -r '.inbounds[] | select(.type == "direct") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
-        local fwd_rules=() i=1
-        while IFS= read -r tag; do
-            [ -n "$tag" ] || continue
-            fwd_rules+=("$tag")
-        done < <(jq -r '.inbounds[] | select(.type == "direct") | .tag' "$CONFIG_FILE" 2>/dev/null)
-
-        printf "  %b当前转发规则列表:%b\n" "$CYAN" "$NC"
         if [ ${#fwd_rules[@]} -eq 0 ]; then
-            printf "    %b暂无端口转发规则%b\n\n" "$DIM" "$NC"
+            printf "  %b暂无转发规则%b\n\n" "$DIM" "$NC"
         else
             for tag in "${fwd_rules[@]}"; do
-                local lp dest_ip dest_port
                 lp=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .listen_port' "$CONFIG_FILE")
                 dest_ip=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .override_address' "$CONFIG_FILE")
                 dest_port=$(jq -r --arg t "$tag" '.inbounds[] | select(.tag == $t) | .override_port' "$CONFIG_FILE")
-                printf "  %b%d.%b 本机端口 %b%s%b -> 目标 %s:%s\n" "$GREEN" "$i" "$NC" "$YELLOW" "$lp" "$NC" "$dest_ip" "$dest_port"
+                printf "  %b%d.%b 本机 :%b%s%b -> %s:%s\n" "$GREEN" "$i" "$NC" "$YELLOW" "$lp" "$NC" "$dest_ip" "$dest_port"
                 i=$((i + 1))
             done
             printf '\n'
         fi
 
-        menu_single 1 "添加新的端口转发"
-        menu_single 2 "删除端口转发规则"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice fwd_opt "> 请选择操作 [0-2]: "
+        menu_pair 1 "添加转发" 2 "删除转发"
+        menu_single 0 "返回"
+        _read_menu_choice fwd_opt "> 选择 [0-2]: "
         case "$fwd_opt" in
             1)
                 acquire_lock || continue
                 install_singbox_bin || continue
                 deploy_sbx_service
+                local local_port dest_host dest_port tmp_c
+                read -rp "  本机监听端口: " local_port; local_port="${local_port// /}"
+                [[ "$local_port" =~ ^[0-9]+$ ]] && [ "$local_port" -ge 1 ] && [ "$local_port" -le 65535 ] || { printf '%b[!] 端口无效%b\n' "$RED" "$NC"; pause_for_enter; continue; }
+                read -rp "  目标地址 (IP/域名): " dest_host; dest_host="${dest_host// /}"
+                [ -n "$dest_host" ] || { printf '%b[!] 地址不能为空%b\n' "$RED" "$NC"; pause_for_enter; continue; }
+                read -rp "  目标端口: " dest_port; dest_port="${dest_port// /}"
+                [[ "$dest_port" =~ ^[0-9]+$ ]] && [ "$dest_port" -ge 1 ] && [ "$dest_port" -le 65535 ] || { printf '%b[!] 端口无效%b\n' "$RED" "$NC"; pause_for_enter; continue; }
 
-                local local_port dest_host dest_port
-                printf '\n'
-                read -rp "  请输入本机监听端口: " local_port
-                local_port="${local_port// /}"
-                [[ "$local_port" =~ ^[0-9]+$ ]] && [ "$local_port" -ge 1 ] && [ "$local_port" -le 65535 ] || {
-                    printf '%b[!] 监听端口不合法。%b\n' "$RED" "$NC"; pause_for_enter; continue;
-                }
-
-                read -rp "  请输入目标 IP 或域名: " dest_host
-                dest_host="${dest_host// /}"
-                [ -n "$dest_host" ] || { printf '%b[!] 目标地址不能为空。%b\n' "$RED" "$NC"; pause_for_enter; continue; }
-
-                read -rp "  请输入目标端口: " dest_port
-                dest_port="${dest_port// /}"
-                [[ "$dest_port" =~ ^[0-9]+$ ]] && [ "$dest_port" -ge 1 ] && [ "$dest_port" -le 65535 ] || {
-                    printf '%b[!] 目标端口不合法。%b\n' "$RED" "$NC"; pause_for_enter; continue;
-                }
-
-                local fwd_tag="fwd-${local_port}"
-                local tmp_c
                 tmp_c=$(mktemp /tmp/sbx_fwd_XXXXXX)
-                jq --arg tag "$fwd_tag" \
-                   --argjson lp "$local_port" \
-                   --arg host "$dest_host" \
-                   --argjson dp "$dest_port" \
-                   '.inbounds = [.inbounds[] | select(.tag != $tag)] + [{
-                      "type": "direct",
-                      "tag": $tag,
-                      "listen": "::",
-                      "listen_port": $lp,
-                      "override_address": $host,
-                      "override_port": $dp
-                   }]' "$CONFIG_FILE" > "$tmp_c"
-
-                if ! sbx_apply_config_safe "$tmp_c"; then
-                    pause_for_enter
-                    continue
-                fi
-
-                printf '\n%b[成功] 端口转发已添加: 本机 %s -> %s:%s%b\n' "$GREEN" "$local_port" "$dest_host" "$dest_port" "$NC"
-                pause_for_enter
-                ;;
+                jq --arg tag "fwd-${local_port}" --argjson lp "$local_port" --arg host "$dest_host" --argjson dp "$dest_port" '
+                  .inbounds = [.inbounds[] | select(.tag != $tag)] + [{
+                    "type": "direct", "tag": $tag, "listen": "::",
+                    "listen_port": $lp, "override_address": $host, "override_port": $dp
+                  }]' "$CONFIG_FILE" > "$tmp_c"
+                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已添加 :%s -> %s:%s%b\n' "$GREEN" "$local_port" "$dest_host" "$dest_port" "$NC"
+                pause_for_enter ;;
             2)
                 [ ${#fwd_rules[@]} -gt 0 ] || { pause_for_enter; continue; }
-                printf '\n'
-                read -rp "  请输入要删除的转发规则编号 [1-${#fwd_rules[@]}]: " idx
-                idx="${idx// /}"
+                local idx
+                read -rp "  删除规则编号 [1-${#fwd_rules[@]}]: " idx; idx="${idx// /}"
                 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#fwd_rules[@]}" ]; then
-                    local sel_tag="${fwd_rules[$((idx - 1))]}"
-                    if confirm_action "确认删除规则: ${sel_tag}？"; then
-                        acquire_lock || continue
-                        local tmp_c
-                        tmp_c=$(mktemp /tmp/sbx_fwd_del_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
-                        if ! sbx_apply_config_safe "$tmp_c"; then
-                            pause_for_enter
-                            continue
-                        fi
-                        printf '%b[成功] 规则已删除！%b\n' "$GREEN" "$NC"
-                        pause_for_enter
-                    fi
-                fi
-                ;;
+                    local sel_tag="${fwd_rules[$((idx - 1))]}" tmp_c
+                    confirm_action "删除规则 ${sel_tag}？" || continue
+                    acquire_lock || continue
+                    tmp_c=$(mktemp /tmp/sbx_fwd_del_XXXXXX)
+                    jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
+                    sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已删除%b\n' "$GREEN" "$NC"
+                    pause_for_enter
+                fi ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
@@ -1521,19 +1008,17 @@ _has_warp_outbound() {
 
 _is_warp_global() {
     [ -f "$CONFIG_FILE" ] || return 1
-    local fin
-    fin=$(jq -r '.route.final // empty' "$CONFIG_FILE" 2>/dev/null)
-    [ "$fin" = "warp-out" ]
+    [ "$(jq -r '.route.final // empty' "$CONFIG_FILE" 2>/dev/null)" = "warp-out" ]
 }
 
 _has_warp_ai_rule() {
     [ -f "$CONFIG_FILE" ] || return 1
-    jq -e '.route.rules[]? | select(.outbound == "warp-out" and (.rule_set == "geosite-ai" or ((.rule_set? // []) | index("geosite-ai")) or ((.domain_suffix? // []) | index("openai.com"))))' "$CONFIG_FILE" >/dev/null 2>&1
+    jq -e '.route.rules[]? | select(.outbound == "warp-out" and (.rule_set == "geosite-ai" or ((.rule_set? // []) | index("geosite-ai"))))' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 _has_warp_stream_rule() {
     [ -f "$CONFIG_FILE" ] || return 1
-    jq -e '.route.rules[]? | select(.outbound == "warp-out" and (.rule_set == "geosite-stream" or ((.rule_set? // []) | index("geosite-stream")) or ((.domain_suffix? // []) | index("netflix.com"))))' "$CONFIG_FILE" >/dev/null 2>&1
+    jq -e '.route.rules[]? | select(.outbound == "warp-out" and (.rule_set == "geosite-stream" or ((.rule_set? // []) | index("geosite-stream"))))' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
 _get_warp_custom_domains() {
@@ -1541,155 +1026,185 @@ _get_warp_custom_domains() {
     jq -r '.warp_custom_domains[]? // empty' "$STATE_FILE" 2>/dev/null
 }
 
-_sync_warp_custom_rules() {
-    local cfg_in="$1" cfg_out="$2"
-    local doms_json
-    doms_json=$(jq -c '.warp_custom_domains // []' "$STATE_FILE" 2>/dev/null || echo "[]")
+_get_warp_nodes() {
+    [ -f "$STATE_FILE" ] || return 0
+    jq -r '.warp_nodes[]? // empty' "$STATE_FILE" 2>/dev/null
+}
 
+_sync_warp_custom_rules() {
+    local cfg_in="$1" cfg_out="$2" doms_json
+    doms_json=$(jq -c '.warp_custom_domains // []' "$STATE_FILE" 2>/dev/null || echo "[]")
     if [ "$doms_json" = "[]" ] || [ -z "$doms_json" ]; then
-        jq '
-          .route.rules = [
-            .route.rules[]? | select(
-              .outbound != "warp-out" or
-              .rule_set != null or
-              ((.domain_suffix? // []) | (index("openai.com") != null or index("netflix.com") != null))
-            )
-          ]
-        ' "$cfg_in" > "$cfg_out"
+        jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .rule_set != null or .inbound != null)]' "$cfg_in" > "$cfg_out"
     else
         jq --argjson doms "$doms_json" '
-          .route.rules = [
-            .route.rules[]? | select(
-              .outbound != "warp-out" or
-              .rule_set != null or
-              ((.domain_suffix? // []) | (index("openai.com") != null or index("netflix.com") != null))
-            )
-          ] + [{
-            "action": "route",
-            "domain_suffix": $doms,
-            "outbound": "warp-out"
+          .route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .rule_set != null or .inbound != null)] + [{
+            "action": "route", "domain_suffix": $doms, "outbound": "warp-out"
           }]
         ' "$cfg_in" > "$cfg_out"
     fi
 }
 
+_sync_warp_node_rules() {
+    local cfg_in="$1" cfg_out="$2" nodes_json
+    nodes_json=$(jq -c '[.warp_nodes[]? as $t | select(.nodes[$t] != null) | $t]' "$STATE_FILE" 2>/dev/null || echo "[]")
+    if [ "$nodes_json" = "[]" ] || [ -z "$nodes_json" ]; then
+        jq '.route.rules = [.route.rules[]? | select(.outbound != "warp-out" or .inbound == null)]' "$cfg_in" > "$cfg_out"
+    else
+        jq --argjson ibs "$nodes_json" '
+          .route.rules = (
+            (if ([.route.rules[]? | select(.ip_is_private == true)] | length) == 0 then
+              [{ "action": "route", "ip_is_private": true, "outbound": "direct" }]
+            else [] end) +
+            [.route.rules[]? | select(.outbound != "warp-out" or .inbound == null)] +
+            [{ "action": "route", "inbound": $ibs, "outbound": "warp-out" }]
+          )
+        ' "$cfg_in" > "$cfg_out"
+    fi
+}
+
+_manage_warp_nodes() {
+    if ! _has_warp_outbound; then
+        printf '\n%b[!] 请先选 1 接入 WARP 出口%b\n' "$YELLOW" "$NC"
+        pause_for_enter; return 1
+    fi
+    while true; do
+        menu_header "指定节点走 WARP"
+        local tags=() t i=1 n p st
+        while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
+        if [ "${#tags[@]}" -eq 0 ]; then
+            printf "  %b当前暂无 Reality 节点，请先在节点管理中添加。%b\n" "$YELLOW" "$NC"
+            pause_for_enter; return 0
+        fi
+        printf "  %b选择节点编号以 开启 / 关闭 该节点全流量走 WARP:%b\n\n" "$DIM" "$NC"
+        for t in "${tags[@]}"; do
+            n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
+            p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
+            if _is_node_warp "$t"; then
+                st="${GREEN}[已绑定 WARP]${NC}"
+            else
+                st="${DIM}[默认分流/直连]${NC}"
+            fi
+            printf "  %b%2d.%b %-18s (:%s)  %b\n" "$GREEN" "$i" "$NC" "$n" "$p" "$st"
+            i=$((i + 1))
+        done
+        print_divider
+        printf "  %b输入节点序号切换状态  |  a 全部开启  |  c 全部取消  |  0 返回%b\n" "$DIM" "$NC"
+        _read_menu_choice wn_opt "> 选择: "
+        local tmp_s tmp_c
+        case "$wn_opt" in
+            0|'') return 0 ;;
+            a|A)
+                acquire_lock || continue
+                tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
+                jq '.warp_nodes = (.nodes | keys)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
+                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 所有节点已绑定走 WARP%b\n' "$GREEN" "$NC"
+                sleep 0.6 ;;
+            c|C)
+                acquire_lock || continue
+                tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
+                jq '.warp_nodes = []' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
+                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已取消所有节点的 WARP 绑定%b\n' "$GREEN" "$NC"
+                sleep 0.6 ;;
+            *)
+                if [[ "$wn_opt" =~ ^[0-9]+$ ]] && [ "$wn_opt" -ge 1 ] && [ "$wn_opt" -le "${#tags[@]}" ]; then
+                    local sel_tag="${tags[$((wn_opt - 1))]}" sel_name
+                    sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
+                    acquire_lock || continue
+                    tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
+                    if _is_node_warp "$sel_tag"; then
+                        jq --arg t "$sel_tag" '.warp_nodes = ([.warp_nodes[]? | select(. != $t)])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                        _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
+                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 节点 [%s] 已恢复默认出站%b\n' "$GREEN" "$sel_name" "$NC"
+                    else
+                        jq --arg t "$sel_tag" '.warp_nodes = (((.warp_nodes // []) + [$t]) | unique)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                        _sync_warp_node_rules "$CONFIG_FILE" "$tmp_c"
+                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 节点 [%s] 已指定走 WARP%b\n' "$GREEN" "$sel_name" "$NC"
+                    fi
+                    sleep 0.6
+                fi ;;
+        esac
+    done
+}
+
 _show_warp_rules_detail() {
-    menu_header "当前 WARP 路由与分流规则明细"
+    menu_header "WARP 分流规则详情"
+    local ep_st mode_st ai_st stream_st c_doms=() w_nodes=() d t n
+    _has_warp_outbound && ep_st="${GREEN}已开启 (WireGuard)${NC}" || ep_st="${DIM}未配置${NC}"
+    _is_warp_global && mode_st="${YELLOW}全局 WARP${NC}" || mode_st="${CYAN}按规则分流 (默认直连)${NC}"
+    _has_warp_ai_rule && ai_st="${GREEN}已启用${NC} (geosite-category-ai-chat-!cn)" || ai_st="${DIM}未启用${NC}"
+    _has_warp_stream_rule && stream_st="${GREEN}已启用${NC} (geosite-category-entertainment@!cn)" || stream_st="${DIM}未启用${NC}"
+    while IFS= read -r d; do [ -n "$d" ] && c_doms+=("$d"); done < <(_get_warp_custom_domains)
+    while IFS= read -r t; do
+        [ -n "$t" ] || continue
+        n=$(jq -r --arg t "$t" '.nodes[$t].name // empty' "$STATE_FILE")
+        [ -n "$n" ] && w_nodes+=("${n}(${t#vless-reality-})")
+    done < <(_get_warp_nodes)
+
+    printf "  %b端点状态:%b %b  |  %b出站模式:%b %b\n" "$CYAN" "$NC" "$ep_st" "$CYAN" "$NC" "$mode_st"
     print_divider
-
-    local ep_status mode_str
-    if _has_warp_outbound; then
-        ep_status="${GREEN}已配置开启 (WireGuard)${NC}"
-    else
-        ep_status="${DIM}未配置 / 已关闭${NC}"
-    fi
-
-    if _is_warp_global; then
-        mode_str="${YELLOW}${BOLD}全局 WARP 出口 (所有出站流量走 WARP)${NC}"
-    else
-        mode_str="${CYAN}分流模式 (仅规则匹配流量走 WARP，其余直连)${NC}"
-    fi
-
-    printf "  %bWARP 端点状态:%b  %b\n" "$CYAN" "$NC" "$ep_status"
-    printf "  %b当前出站模式:%b  %b\n" "$CYAN" "$NC" "$mode_str"
-    print_divider
-
-    printf "  %b[ 分流规则清单 ]%b\n\n" "$PURPLE$BOLD" "$NC"
-
-    # 1. AI 智能分流
-    local ai_status
-    if _has_warp_ai_rule; then
-        ai_status="${GREEN}已启用 (Sing-box 官方上游规则集)${NC}"
-    else
-        ai_status="${DIM}未启用${NC}"
-    fi
-    printf "  1. %bAI 智能服务分流%b: %b\n" "$BOLD" "$NC" "$ai_status"
-    printf "     上游规则: SagerNet/sing-geosite (category-ai-chat-!cn)\n"
-    printf "     覆盖范围: ChatGPT, Claude, Gemini, Copilot, Perplexity, Poe 等\n"
-    printf "     目标出口: warp-out\n\n"
-
-    # 2. 流媒体
-    local stream_status
-    if _has_warp_stream_rule; then
-        stream_status="${GREEN}已启用 (Sing-box 官方上游规则集)${NC}"
-    else
-        stream_status="${DIM}未启用${NC}"
-    fi
-    printf "  2. %b主流流媒体服务分流%b: %b\n" "$BOLD" "$NC" "$stream_status"
-    printf "     上游规则: SagerNet/sing-geosite (category-entertainment@!cn)\n"
-    printf "     覆盖范围: Netflix, YouTube, Disney+, Spotify, HBO 等全球主流流媒体\n"
-    printf "     目标出口: warp-out\n\n"
-
-    # 3. 自定义域名
-    local c_doms=()
-    while IFS= read -r d; do
-        [ -n "$d" ] && c_doms+=("$d")
-    done < <(_get_warp_custom_domains)
-
-    if [ "${#c_doms[@]}" -gt 0 ]; then
-        printf "  3. %b自定义域名分流%b: %b已配置 %d 个域名%b\n" "$BOLD" "$NC" "$GREEN" "${#c_doms[@]}" "$NC"
-        printf "     域名列表: %s\n" "${c_doms[*]}"
-        printf "     目标出口: warp-out\n"
-    else
-        printf "  3. %b自定义域名分流%b: %b未配置%b\n" "$BOLD" "$NC" "$DIM" "$NC"
-        printf "     可通过菜单选项 [8] 随时添加指定域名\n"
-    fi
-
+    printf "  1. %b指定节点分流:%b %s\n" "$BOLD" "$NC" "${w_nodes[*]:-无}"
+    printf "  2. %bAI 智能分流 :%b %b\n" "$BOLD" "$NC" "$ai_st"
+    printf "  3. %b流媒体分流  :%b %b\n" "$BOLD" "$NC" "$stream_st"
+    printf "  4. %b自定义域名  :%b %s\n" "$BOLD" "$NC" "${c_doms[*]:-无}"
     print_divider
     pause_for_enter
 }
 
 _test_warp_connectivity() {
-    printf '\n%b>>> 正在测试 Cloudflare WARP 出口连通性...%b\n' "$CYAN" "$NC"
-    if ! _has_warp_outbound; then
-        printf '%b[!] WARP 出口未配置，请先接入 WARP。%b\n' "$YELLOW" "$NC"
-        pause_for_enter; return 1;
-    fi
-
-    local ep_json
+    printf '\n%b>>> 测试 WARP 连通性...%b\n' "$CYAN" "$NC"
+    _has_warp_outbound || { printf '%b[!] 请先接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; return 1; }
+    local ep_json test_port=15891 tmp_test test_pid trace_res ip colo warp_flag
     ep_json=$(jq -c '.endpoints[]? | select(.tag == "warp-out")' "$CONFIG_FILE" 2>/dev/null)
-    if [ -z "$ep_json" ]; then
-        printf '%b[!] 未找到 warp-out 端点配置。%b\n' "$RED" "$NC"
-        pause_for_enter; return 1;
-    fi
+    [ -n "$ep_json" ] || { printf '%b[!] 未找到 warp-out 端点%b\n' "$RED" "$NC"; pause_for_enter; return 1; }
 
-    local test_port=15891
-    local tmp_test
     tmp_test=$(mktemp /tmp/sbx_test_warp_XXXXXX.json)
-    jq -n \
-      --argjson ep "$ep_json" \
-      --argjson port "$test_port" \
-      '{
-        "log": { "level": "warn" },
-        "endpoints": [$ep],
-        "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $port }],
-        "outbounds": [{ "type": "direct", "tag": "direct" }],
-        "route": { "rules": [{ "outbound": "warp-out" }] }
-      }' > "$tmp_test"
+    jq -n --argjson ep "$ep_json" --argjson port "$test_port" '{
+      "log": { "level": "warn" }, "endpoints": [$ep],
+      "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $port }],
+      "outbounds": [{ "type": "direct", "tag": "direct" }],
+      "route": { "rules": [{ "outbound": "warp-out" }] }
+    }' > "$tmp_test"
 
     "$BIN_FILE" run -c "$tmp_test" >/dev/null 2>&1 &
-    local test_pid=$!
-    sleep 1.8
+    test_pid=$!; sleep 1.6
+    trace_res=$(curl -x "socks5h://127.0.0.1:${test_port}" -s --connect-timeout 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+    kill "$test_pid" 2>/dev/null || true; rm -f "$tmp_test"
 
-    local trace_res
-    trace_res=$(curl -x "socks5h://127.0.0.1:${test_port}" -s --connect-timeout 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
-    kill "$test_pid" 2>/dev/null || true
-    rm -f "$tmp_test"
-
-    if [ -z "$trace_res" ]; then
-        printf '%b[!] WARP 出口连接超时，请检查服务器海外 UDP 2408 端口网络连通性。%b\n' "$RED" "$NC"
-        pause_for_enter; return 1;
-    fi
-
-    local ip colo warp_flag
+    [ -n "$trace_res" ] || { printf '%b[!] WARP 连接超时%b\n' "$RED" "$NC"; pause_for_enter; return 1; }
     ip=$(echo "$trace_res" | awk -F= '/^ip=/{print $2}')
     colo=$(echo "$trace_res" | awk -F= '/^colo=/{print $2}')
     warp_flag=$(echo "$trace_res" | awk -F= '/^warp=/{print $2}')
+    printf "  %b状态:%b %b连通%b  |  %bIP:%b %s  |  %b节点:%b %s  |  %bWARP:%b %s\n" \
+        "$CYAN" "$NC" "$GREEN" "$NC" "$CYAN" "$NC" "${ip:-未知}" "$CYAN" "$NC" "${colo:-未知}" "$CYAN" "$NC" "${warp_flag:-未知}"
+    pause_for_enter
+}
 
-    printf '\n  %b出口状态:%b  %b正常连通%b\n' "$CYAN" "$NC" "$GREEN$BOLD" "$NC"
-    printf '  %b出口 IP:%b   %s\n' "$CYAN" "$NC" "${ip:-未知}"
-    printf '  %b数据中心:%b  %s\n' "$CYAN" "$NC" "${colo:-未知}"
-    printf '  %bWARP 状态:%b %s\n\n' "$CYAN" "$NC" "${warp_flag:-未知}"
+_toggle_geosite_rule() {
+    local r_tag="$1" r_name="$2" r_file="$3"
+    _has_warp_outbound || { printf '\n%b[!] 请先选 1 接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; return 1; }
+    acquire_lock || return 1
+    local tmp_c
+    tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
+    if jq -e --arg t "$r_tag" '.route.rules[]? | select(.outbound == "warp-out" and (.rule_set == $t or ((.rule_set? // []) | index($t))))' "$CONFIG_FILE" >/dev/null 2>&1; then
+        jq --arg t "$r_tag" '
+          .route.rule_set = [.route.rule_set[]? | select(.tag != $t)] |
+          .route.rules = [.route.rules[]? | select(.outbound != "warp-out" or (.rule_set != $t and ((.rule_set? // []) | index($t) == null)))]
+        ' "$CONFIG_FILE" > "$tmp_c"
+        sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] %s 已关闭%b\n' "$GREEN" "$r_name" "$NC"
+    else
+        jq --arg t "$r_tag" --arg url "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${r_file}" '
+          .route.rule_set = ([.route.rule_set[]? | select(.tag != $t)] + [{
+            "tag": $t, "type": "remote", "format": "binary", "url": $url, "download_detour": "direct"
+          }]) |
+          .route.rules = ([.route.rules[]? | select(.outbound != "warp-out" or (.rule_set != $t and ((.rule_set? // []) | index($t) == null)))] + [{
+            "action": "route", "rule_set": $t, "outbound": "warp-out"
+          }])
+        ' "$CONFIG_FILE" > "$tmp_c"
+        sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] %s 已开启%b\n' "$GREEN" "$r_name" "$NC"
+    fi
     pause_for_enter
 }
 
@@ -1697,400 +1212,149 @@ manage_warp() {
     while true; do
         menu_header "Cloudflare WARP 出口与分流"
         init_sbx_config
-
-        local warp_status mode_status rule_summary
-        if _has_warp_outbound; then
-            warp_status="${GREEN}已配置开启 (WireGuard)${NC}"
-        else
-            warp_status="${DIM}未配置 / 已关闭${NC}"
-        fi
-
-        if _is_warp_global; then
-            mode_status="${YELLOW}${BOLD}全局 WARP (所有流量走 WARP)${NC}"
-        else
-            mode_status="${CYAN}分流模式 (仅规则匹配流量走 WARP)${NC}"
-        fi
-
-        local ai_tag stream_tag custom_count
+        local warp_st mode_st ai_tag stream_tag dom_cnt node_cnt
+        _has_warp_outbound && warp_st="${GREEN}已开启${NC}" || warp_st="${DIM}未配置${NC}"
+        _is_warp_global && mode_st="${YELLOW}全局 WARP${NC}" || mode_st="${CYAN}分流模式${NC}"
         _has_warp_ai_rule && ai_tag="${GREEN}开${NC}" || ai_tag="${DIM}关${NC}"
         _has_warp_stream_rule && stream_tag="${GREEN}开${NC}" || stream_tag="${DIM}关${NC}"
-        custom_count=$(jq '.warp_custom_domains | length' "$STATE_FILE" 2>/dev/null || echo 0)
-        rule_summary="AI分流: [${ai_tag}] · 流媒体: [${stream_tag}] · 自定义: [${CYAN}${custom_count}${NC}个]"
+        dom_cnt=$(jq '.warp_custom_domains | length' "$STATE_FILE" 2>/dev/null || echo 0)
+        node_cnt=$(jq '[.warp_nodes[]? as $t | select(.nodes[$t] != null)] | length' "$STATE_FILE" 2>/dev/null || echo 0)
 
-        printf "  %bWARP 端点状态:%b %b\n" "$CYAN" "$NC" "$warp_status"
-        printf "  %b当前出站模式:%b %b\n" "$CYAN" "$NC" "$mode_status"
-        printf "  %b当前规则状态:%b %b\n\n" "$CYAN" "$NC" "$rule_summary"
+        printf "  %bWARP:%b %b  |  %b模式:%b %b\n" "$CYAN" "$NC" "$warp_st" "$CYAN" "$NC" "$mode_st"
+        printf "  %b分流:%b 节点[%b%s%b] · AI[%b] · 流媒体[%b] · 域名[%b%s%b]\n\n" \
+            "$CYAN" "$NC" "$YELLOW" "$node_cnt" "$NC" "$ai_tag" "$stream_tag" "$CYAN" "$dom_cnt" "$NC"
 
-        printf "  %b[ 基础与状态 ]%b\n" "$PURPLE" "$NC"
-        menu_single 1 "接入 / 重新生成 Cloudflare WARP 官方 WireGuard 出口"
-        menu_single 2 "查看当前全部分流规则详情"
-        menu_single 3 "测试 WARP 出口连通性与 IP 状态"
+        menu_pair 1 "接入/重置 WARP" 2 "查看规则详情"
+        menu_pair 3 "测试 WARP 连通" 4 "全局 WARP 开关"
+        print_divider
+        menu_pair 5 "指定节点走 WARP" 6 "AI 分流开关"
+        menu_pair 7 "流媒体分流开关" 8 "添加分流域名"
+        menu_pair 9 "删除分流域名" 10 "彻底移除 WARP"
+        menu_single 0 "返回"
 
-        printf "\n  %b[ 出口与分流模式 ]%b\n" "$PURPLE" "$NC"
-        menu_single 4 "切换为【全局 WARP 出口】(所有未被私有地址绕过的流量走 WARP)"
-        menu_single 5 "切换为【默认直连出口】(仅规则匹配流量走 WARP)"
-
-        printf "\n  %b[ 分流规则管理 (上游规则集+自定义) ]%b\n" "$PURPLE" "$NC"
-        menu_single 6 "开启 / 关闭【AI 智能分流】(ChatGPT/Claude/Gemini/Copilot等)"
-        menu_single 7 "开启 / 关闭【主流流媒体分流】(Netflix/YouTube/Disney+等)"
-        menu_single 8 "添加【自定义域名分流】(支持批量输入，如: claude.ai anthropic.com)"
-        menu_single 9 "查看并删除指定的自定义分流域名"
-
-        printf "\n  %b[ 清理与返回 ]%b\n" "$PURPLE" "$NC"
-        menu_single 10 "彻底移除 WARP 出口与所有关联规则"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice warp_opt "> 请选择操作 [0-10]: "
+        _read_menu_choice warp_opt "> 选择 [0-10]: "
         case "$warp_opt" in
             1)
                 acquire_lock || continue
                 install_singbox_bin || continue
                 deploy_sbx_service
-
-                printf '\n%b>>> 正在向 Cloudflare WARP 官方 API 注册设备与密钥...%b\n' "$CYAN" "$NC"
-                local wg_keys priv_key pub_key
+                printf '\n%b>>> 注册 Cloudflare WARP...%b\n' "$CYAN" "$NC"
+                local wg_keys priv_key pub_key install_id reg_payload reg_res v4_addr v6_addr peer_pub addr_arr warp_endpoint tmp_c
                 wg_keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null)
                 priv_key=$(echo "$wg_keys" | awk '/PrivateKey:/{print $2}' | tr -d '\r')
                 pub_key=$(echo "$wg_keys" | awk '/PublicKey:/{print $2}' | tr -d '\r')
+                [ -n "$priv_key" ] && [ -n "$pub_key" ] || { printf '%b[!] 生成密钥失败%b\n' "$RED" "$NC"; pause_for_enter; continue; }
 
-                if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-                    printf '%b[!] 生成 WireGuard 密钥对失败，请检查 sing-box 核心。%b\n' "$RED" "$NC"
-                    pause_for_enter; continue;
-                fi
-
-                local install_id
                 install_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' || openssl rand -hex 16)
-                local reg_payload reg_res
                 reg_payload=$(jq -n --arg key "$pub_key" --arg iid "$install_id" \
                   '{key: $key, install_id: $iid, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $iid, locale: "en_US"}')
-
                 reg_res=$(curl -s -X POST "https://api.cloudflareclient.com/v0a2158/reg" \
-                  -H "User-Agent: okhttp/3.12.1" \
-                  -H "CF-Client-Version: a-6.3-2158" \
-                  -H "Content-Type: application/json" \
+                  -H "User-Agent: okhttp/3.12.1" -H "CF-Client-Version: a-6.3-2158" -H "Content-Type: application/json" \
                   -d "$reg_payload" --connect-timeout 10 2>/dev/null)
 
-                local v4_addr v6_addr peer_pub peer_ip
-                v4_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v4 // empty')
+                v4_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v4 // "172.16.0.2"')
                 v6_addr=$(echo "$reg_res" | jq -r '.config.interface.addresses.v6 // empty')
                 peer_pub=$(echo "$reg_res" | jq -r '.config.peers[0].public_key // "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="')
-                peer_ip="162.159.192.8"
+                [ -n "$v6_addr" ] && addr_arr="[\"${v4_addr}/32\", \"${v6_addr}/128\"]" || addr_arr="[\"${v4_addr}/32\"]"
 
-                [ -n "$v4_addr" ] || v4_addr="172.16.0.2"
-
-                local addr_arr
-                if [ -n "$v6_addr" ]; then
-                    addr_arr="[\"${v4_addr}/32\", \"${v6_addr}/128\"]"
-                else
-                    addr_arr="[\"${v4_addr}/32\"]"
-                fi
-
-                local warp_endpoint
-                warp_endpoint=$(jq -n \
-                  --arg priv "$priv_key" \
-                  --arg pub "$peer_pub" \
-                  --arg pip "$peer_ip" \
-                  --argjson addrs "$addr_arr" \
-                  '{
-                    "type": "wireguard",
-                    "tag": "warp-out",
-                    "address": $addrs,
-                    "private_key": $priv,
-                    "peers": [
-                      {
-                        "address": $pip,
-                        "port": 2408,
-                        "public_key": $pub,
-                        "allowed_ips": ["0.0.0.0/0", "::/0"]
-                      }
-                    ]
-                  }')
-
-                local tmp_c
+                warp_endpoint=$(jq -n --arg priv "$priv_key" --arg pub "$peer_pub" --argjson addrs "$addr_arr" '{
+                  "type": "wireguard", "tag": "warp-out", "address": $addrs, "private_key": $priv,
+                  "peers": [{ "address": "162.159.192.8", "port": 2408, "public_key": $pub, "allowed_ips": ["0.0.0.0/0", "::/0"] }]
+                }')
                 tmp_c=$(mktemp /tmp/sbx_warp_XXXXXX)
                 jq --argjson ep "$warp_endpoint" '
                   .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + [$ep]) |
                   .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
                 ' "$CONFIG_FILE" > "$tmp_c"
-
-                if ! sbx_apply_config_safe "$tmp_c"; then
-                    pause_for_enter
-                    continue
-                fi
-
-                printf '\n%b[成功] Cloudflare WARP 官方设备注册成功，WireGuard 端点已接入！%b\n' "$GREEN" "$NC"
-                pause_for_enter
-                ;;
-            2)
-                _show_warp_rules_detail
-                ;;
-            3)
-                _test_warp_connectivity
-                ;;
+                sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] WARP 端点已就绪 (%s)%b\n' "$GREEN" "$v4_addr" "$NC"
+                pause_for_enter ;;
+            2) _show_warp_rules_detail ;;
+            3) _test_warp_connectivity ;;
             4)
-                if ! _has_warp_outbound; then
-                    printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
+                _has_warp_outbound || { printf '\n%b[!] 请先选 1 接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
+                acquire_lock || continue
+                local tmp_c
+                tmp_c=$(mktemp /tmp/sbx_global_XXXXXX)
                 if _is_warp_global; then
-                    printf '\n%b[提示] 当前已经是全局 WARP 出口。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-                if confirm_action "确认将出站模式切换为【全局 WARP 出口】？(所有流量默认走 WARP，私有内网 IP 自动直连)"; then
-                    acquire_lock || continue
-                    local tmp_c
-                    tmp_c=$(mktemp /tmp/sbx_global_XXXXXX)
+                    jq '.route.final = "direct"' "$CONFIG_FILE" > "$tmp_c"
+                    sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] 已切换为【分流模式 (默认直连)】%b\n' "$GREEN" "$NC"
+                else
+                    confirm_action "开启全局 WARP (所有出站默认走 WARP)？" || continue
                     jq '
                       .route.rules = (
                         (if ([.route.rules[]? | select(.ip_is_private == true)] | length) == 0 then
                           [{ "action": "route", "ip_is_private": true, "outbound": "direct" }]
                         else [] end) + .route.rules
-                      ) |
-                      .route.final = "warp-out"
+                      ) | .route.final = "warp-out"
                     ' "$CONFIG_FILE" > "$tmp_c"
-                    if ! sbx_apply_config_safe "$tmp_c"; then
-                        pause_for_enter; continue;
-                    fi
-                    printf '\n%b[成功] 已切换为【全局 WARP 出口】！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
+                    sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] 已开启【全局 WARP 出口】%b\n' "$GREEN" "$NC"
                 fi
-                ;;
-            5)
-                if ! _is_warp_global; then
-                    printf '\n%b[提示] 当前已经是默认直连模式。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-                if confirm_action "确认切换为【默认直连出口】？(仅规则匹配的域名走 WARP)"; then
-                    acquire_lock || continue
-                    local tmp_c
-                    tmp_c=$(mktemp /tmp/sbx_direct_XXXXXX)
-                    jq '.route.final = "direct"' "$CONFIG_FILE" > "$tmp_c"
-                    if ! sbx_apply_config_safe "$tmp_c"; then
-                        pause_for_enter; continue;
-                    fi
-                    printf '\n%b[成功] 已切换为【默认直连出口】！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
-            6)
-                if ! _has_warp_outbound; then
-                    printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-                acquire_lock || continue
-                local tmp_c
-                tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
-                if _has_warp_ai_rule; then
-                    # 关闭 AI 分流
-                    jq '
-                      .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-ai")] |
-                      .route.rules = [.route.rules[]? | select(
-                        .outbound != "warp-out" or
-                        (.rule_set != "geosite-ai" and ((.rule_set? // []) | index("geosite-ai") == null) and ((.domain_suffix? // []) | index("openai.com") == null))
-                      )]
-                    ' "$CONFIG_FILE" > "$tmp_c"
-                    if sbx_apply_config_safe "$tmp_c"; then
-                        printf '\n%b[成功] AI 智能分流规则已关闭！%b\n' "$GREEN" "$NC"
-                    fi
-                else
-                    # 开启 AI 分流 (接入 Sing-box 上游 SagerNet/sing-geosite)
-                    printf '\n%b>>> 正在注入 Sing-box 上游 AI 官方规则集 (category-ai-chat-!cn)...%b\n' "$CYAN" "$NC"
-                    jq '
-                      .route.rule_set = ([.route.rule_set[]? | select(.tag != "geosite-ai")] + [{
-                        "tag": "geosite-ai",
-                        "type": "remote",
-                        "format": "binary",
-                        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ai-chat-!cn.srs",
-                        "download_detour": "direct"
-                      }]) |
-                      .route.rules = ([.route.rules[]? | select(
-                        .outbound != "warp-out" or
-                        (.rule_set != "geosite-ai" and ((.rule_set? // []) | index("geosite-ai") == null) and ((.domain_suffix? // []) | index("openai.com") == null))
-                      )] + [{
-                        "action": "route",
-                        "rule_set": "geosite-ai",
-                        "outbound": "warp-out"
-                      }])
-                    ' "$CONFIG_FILE" > "$tmp_c"
-                    if sbx_apply_config_safe "$tmp_c"; then
-                        printf '\n%b[成功] AI 智能分流规则已生效 (全面支持 ChatGPT/Claude/Gemini/Copilot 等)！%b\n' "$GREEN" "$NC"
-                    fi
-                fi
-                pause_for_enter
-                ;;
-            7)
-                if ! _has_warp_outbound; then
-                    printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-                acquire_lock || continue
-                local tmp_c
-                tmp_c=$(mktemp /tmp/sbx_rule_XXXXXX)
-                if _has_warp_stream_rule; then
-                    # 关闭 流媒体分流
-                    jq '
-                      .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-stream")] |
-                      .route.rules = [.route.rules[]? | select(
-                        .outbound != "warp-out" or
-                        (.rule_set != "geosite-stream" and ((.rule_set? // []) | index("geosite-stream") == null) and ((.domain_suffix? // []) | index("netflix.com") == null))
-                      )]
-                    ' "$CONFIG_FILE" > "$tmp_c"
-                    if sbx_apply_config_safe "$tmp_c"; then
-                        printf '\n%b[成功] 主流流媒体分流规则已关闭！%b\n' "$GREEN" "$NC"
-                    fi
-                else
-                    # 开启 流媒体分流 (接入 Sing-box 上游 SagerNet/sing-geosite)
-                    printf '\n%b>>> 正在注入 Sing-box 上游流媒体官方规则集 (category-entertainment@!cn)...%b\n' "$CYAN" "$NC"
-                    jq '
-                      .route.rule_set = ([.route.rule_set[]? | select(.tag != "geosite-stream")] + [{
-                        "tag": "geosite-stream",
-                        "type": "remote",
-                        "format": "binary",
-                        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-entertainment@!cn.srs",
-                        "download_detour": "direct"
-                      }]) |
-                      .route.rules = ([.route.rules[]? | select(
-                        .outbound != "warp-out" or
-                        (.rule_set != "geosite-stream" and ((.rule_set? // []) | index("geosite-stream") == null) and ((.domain_suffix? // []) | index("netflix.com") == null))
-                      )] + [{
-                        "action": "route",
-                        "rule_set": "geosite-stream",
-                        "outbound": "warp-out"
-                      }])
-                    ' "$CONFIG_FILE" > "$tmp_c"
-                    if sbx_apply_config_safe "$tmp_c"; then
-                        printf '\n%b[成功] 主流流媒体分流规则已生效 (全面支持 Netflix/YouTube/Disney+/Spotify 等)！%b\n' "$GREEN" "$NC"
-                    fi
-                fi
-                pause_for_enter
-                ;;
+                pause_for_enter ;;
+            5) _manage_warp_nodes ;;
+            6) _toggle_geosite_rule "geosite-ai" "AI 智能分流" "geosite-category-ai-chat-!cn.srs" ;;
+            7) _toggle_geosite_rule "geosite-stream" "流媒体分流" "geosite-category-entertainment@!cn.srs" ;;
             8)
-                if ! _has_warp_outbound; then
-                    printf '\n%b[!] 请先选 1 接入 WARP 出口。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-                printf '\n%b请输入需要引导走 WARP 的域名 (支持多个域名，以空格分隔):%b\n' "$CYAN" "$NC"
-                printf '%b示例: claude.ai anthropic.com reddit.com%b\n' "$DIM" "$NC"
-                read -rp "  输入域名: " raw_doms
+                _has_warp_outbound || { printf '\n%b[!] 请先选 1 接入 WARP%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
+                local raw_doms new_doms=() d tmp_s tmp_c json_arr
+                read -rp "  输入分流域名 (空格分隔, 如 claude.ai reddit.com): " raw_doms
                 raw_doms=$(echo "$raw_doms" | tr -d '\r')
-                if [ -z "$raw_doms" ]; then
-                    printf '%b[!] 输入为空，已取消。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-
-                local new_doms=()
+                [ -n "$raw_doms" ] || continue
                 for d in $raw_doms; do
-                    # 简单清洗: 转小写，去 http:// 或 https://，去末尾斜线
                     d=$(echo "$d" | tr '[:upper:]' '[:lower:]' | sed -E 's|^https?://||; s|/.*$||')
                     [[ "$d" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] && new_doms+=("$d")
                 done
-
-                if [ "${#new_doms[@]}" -eq 0 ]; then
-                    printf '%b[!] 未检测到有效的域名格式。%b\n' "$RED" "$NC"
-                    pause_for_enter; continue;
-                fi
-
+                [ "${#new_doms[@]}" -gt 0 ] || { printf '%b[!] 域名格式无效%b\n' "$RED" "$NC"; pause_for_enter; continue; }
                 acquire_lock || continue
-                local tmp_s
-                tmp_s=$(mktemp /tmp/sbx_state_XXXXXX)
-                local json_arr
+                tmp_s=$(mktemp /tmp/sbx_state_XXXXXX); tmp_c=$(mktemp /tmp/sbx_cfg_XXXXXX)
                 json_arr=$(printf '%s\n' "${new_doms[@]}" | jq -R . | jq -s .)
-                jq --argjson new "$json_arr" '
-                  .warp_custom_domains = ((.warp_custom_domains // []) + $new | unique)
-                ' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-
-                local tmp_c
-                tmp_c=$(mktemp /tmp/sbx_cfg_sync_XXXXXX)
+                jq --argjson new "$json_arr" '.warp_custom_domains = ((.warp_custom_domains // []) + $new | unique)' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
                 _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                if ! sbx_apply_config_safe "$tmp_c"; then
-                    pause_for_enter; continue;
-                fi
-                printf '\n%b[成功] 已成功添加自定义分流域名：%s%b\n' "$GREEN" "${new_doms[*]}" "$NC"
-                pause_for_enter
-                ;;
+                sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已添加: %s%b\n' "$GREEN" "${new_doms[*]}" "$NC"
+                pause_for_enter ;;
             9)
-                local cur_doms=()
-                while IFS= read -r d; do
-                    [ -n "$d" ] && cur_doms+=("$d")
-                done < <(_get_warp_custom_domains)
-
-                if [ "${#cur_doms[@]}" -eq 0 ]; then
-                    printf '\n%b[提示] 当前尚未配置任何自定义分流域名。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter; continue;
-                fi
-
-                menu_header "删除自定义分流域名"
-                printf "  当前已配置的自定义域名列表:\n\n"
-                local idx=1
-                for d in "${cur_doms[@]}"; do
-                    printf "   %b%2d.%b %s\n" "$CYAN" "$idx" "$NC" "$d"
-                    ((idx++))
-                done
-                print_divider
-                printf "  %b输入序号删除指定域名，输入 a 清空全部，输入 0 返回%b\n" "$DIM" "$NC"
-                read -rp "  请选择: " del_choice
-                del_choice=$(echo "$del_choice" | tr -d ' \r\n')
-
+                local cur_doms=() d idx=1 del_choice tmp_s tmp_c
+                while IFS= read -r d; do [ -n "$d" ] && cur_doms+=("$d"); done < <(_get_warp_custom_domains)
+                [ "${#cur_doms[@]}" -gt 0 ] || { printf '\n%b[!] 暂无自定义域名%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
+                printf '\n'
+                for d in "${cur_doms[@]}"; do printf "  %b%2d.%b %s\n" "$CYAN" "$idx" "$NC" "$d"; idx=$((idx + 1)); done
+                read -rp "  输入编号删除 (a 清空全部, 0 返回): " del_choice; del_choice="${del_choice// /}"
                 case "$del_choice" in
                     0|'') continue ;;
                     a|A)
-                        if confirm_action "确认清空所有自定义分流域名？"; then
-                            acquire_lock || continue
-                            local tmp_s tmp_c
-                            tmp_s=$(mktemp /tmp/sbx_state_XXXXXX)
-                            jq '.warp_custom_domains = []' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                            tmp_c=$(mktemp /tmp/sbx_cfg_sync_XXXXXX)
-                            _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                            sbx_apply_config_safe "$tmp_c"
-                            printf '\n%b[成功] 已清空全部自定义分流域名！%b\n' "$GREEN" "$NC"
-                            pause_for_enter
-                        fi
-                        ;;
+                        confirm_action "清空所有自定义分流域名？" || continue
+                        acquire_lock || continue
+                        tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
+                        jq '.warp_custom_domains = []' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                        _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
+                        sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已清空%b\n' "$GREEN" "$NC"
+                        pause_for_enter ;;
                     *)
                         if [[ "$del_choice" =~ ^[0-9]+$ ]] && [ "$del_choice" -ge 1 ] && [ "$del_choice" -le "${#cur_doms[@]}" ]; then
                             local target_dom="${cur_doms[$((del_choice - 1))]}"
                             acquire_lock || continue
-                            local tmp_s tmp_c
-                            tmp_s=$(mktemp /tmp/sbx_state_XXXXXX)
+                            tmp_s=$(mktemp /tmp/sbx_s_XXXXXX); tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
                             jq --arg d "$target_dom" '.warp_custom_domains = [.warp_custom_domains[]? | select(. != $d)]' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                            tmp_c=$(mktemp /tmp/sbx_cfg_sync_XXXXXX)
                             _sync_warp_custom_rules "$CONFIG_FILE" "$tmp_c"
-                            sbx_apply_config_safe "$tmp_c"
-                            printf '\n%b[成功] 已删除自定义域名: %s%b\n' "$GREEN" "$target_dom" "$NC"
+                            sbx_apply_config_safe "$tmp_c" && printf '%b[OK] 已删除: %s%b\n' "$GREEN" "$target_dom" "$NC"
                             pause_for_enter
-                        else
-                            printf '\n%b[!] 序号无效。%b\n' "$RED" "$NC"
-                            pause_for_enter
-                        fi
-                        ;;
-                esac
-                ;;
+                        fi ;;
+                esac ;;
             10)
-                if confirm_action "彻底移除 WARP 出口、全局 WARP 设置与全部关联分流规则？"; then
-                    acquire_lock || continue
-                    local tmp_c tmp_s
-                    tmp_c=$(mktemp /tmp/sbx_warp_del_XXXXXX)
-                    jq '
-                      .endpoints = [.endpoints[]? | select(.tag != "warp-out")] |
-                      .outbounds = [.outbounds[]? | select(.tag != "warp-out")] |
-                      .route.final = "direct" |
-                      .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-ai" and .tag != "geosite-stream")] |
-                      .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]
-                    ' "$CONFIG_FILE" > "$tmp_c"
-
-                    tmp_s=$(mktemp /tmp/sbx_state_del_XXXXXX)
-                    jq '.warp_custom_domains = []' "$STATE_FILE" > "$tmp_s" 2>/dev/null && mv "$tmp_s" "$STATE_FILE"
-
-                    if ! sbx_apply_config_safe "$tmp_c"; then
-                        pause_for_enter
-                        continue
-                    fi
-                    printf '\n%b[成功] WARP 出口、全局设置与全部分流规则已彻底清除！%b\n' "$GREEN" "$NC"
-                    pause_for_enter
-                fi
-                ;;
+                confirm_action "彻底移除 WARP 出口及全部关联规则？" || continue
+                acquire_lock || continue
+                local tmp_c tmp_s
+                tmp_c=$(mktemp /tmp/sbx_warp_del_XXXXXX); tmp_s=$(mktemp /tmp/sbx_state_del_XXXXXX)
+                jq '
+                  .endpoints = [.endpoints[]? | select(.tag != "warp-out")] |
+                  .outbounds = [.outbounds[]? | select(.tag != "warp-out")] |
+                  .route.final = "direct" |
+                  .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-ai" and .tag != "geosite-stream")] |
+                  .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]
+                ' "$CONFIG_FILE" > "$tmp_c"
+                jq '.warp_custom_domains = [] | .warp_nodes = []' "$STATE_FILE" > "$tmp_s" 2>/dev/null && mv "$tmp_s" "$STATE_FILE"
+                sbx_apply_config_safe "$tmp_c" && printf '\n%b[OK] WARP 及分流规则已移除%b\n' "$GREEN" "$NC"
+                pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
@@ -2098,25 +1362,13 @@ manage_warp() {
 # ==================== 彻底卸载与残留清理 ====================
 
 uninstall_all() {
-    menu_header "彻底卸载 SBX 及所有配置残留"
-    printf '%b[警告] 此操作将彻底清除由 SBX 脚本部署的所有资源与配置：%b\n\n' "$RED$BOLD" "$NC"
-    printf "  1. 停止并删除服务单元 (%s)\n" "$SERVICE_SYSTEMD"
-    printf "  2. 永久删除配置目录 (%s，含所有节点/密钥/备份)\n" "$SBX_ROOT"
-    printf "  3. 删除 TCP 网络调优文件 (%s) 并还原内核参数\n" "$TCP_SYSCTL_CONF"
-    printf "  4. 删除日志文件 (%s)\n" "$LOG_FILE"
-    printf "  5. 删除快捷指令 (%s)\n" "$SHORTCUT_PATH"
-    printf "  6. 清除所有运行锁与临时缓存\n\n"
-    printf '  %b安全说明: 不会触碰系统中既有的其他服务或历史脚本文件。%b\n\n' "$CYAN" "$NC"
+    menu_header "彻底卸载 SBX"
+    printf '  %b将停止并移除以下资源:%b\n' "$RED$BOLD" "$NC"
+    printf "  - 服务单元 (%s)\n  - 配置与备份 (%s)\n  - TCP 调优 (%s)\n  - 快捷指令 (%s)\n\n" \
+        "$SERVICE_SYSTEMD" "$SBX_ROOT" "$TCP_SYSCTL_CONF" "$SHORTCUT_PATH"
 
-    if ! confirm_action "确认彻底卸载 SBX 并删除全部配置与残留？" "n"; then
-        printf '\n%b操作已取消。%b\n' "$YELLOW" "$NC"
-        pause_for_enter
-        return 0
-    fi
+    confirm_action "确认彻底卸载 SBX 并删除全部配置？" "n" || return 0
 
-    printf '\n%b>>> 正在停止服务并清理残留...%b\n' "$CYAN" "$NC"
-
-    # 1. 停止与注销服务
     if [ "$INIT_SYS" = "systemd" ]; then
         systemctl stop sbx.service >/dev/null 2>&1 || true
         systemctl disable sbx.service >/dev/null 2>&1 || true
@@ -2128,25 +1380,15 @@ uninstall_all() {
         rm -f "$SERVICE_OPENRC"
     fi
 
-    # 2. 还原 sysctl 调优
     if [ -f "$TCP_SYSCTL_CONF" ]; then
         rm -f "$TCP_SYSCTL_CONF"
         sysctl --system >/dev/null 2>&1 || true
-        printf '  - 内核参数已恢复默认\n'
     fi
-
-    # 3. 删除配置目录与日志
     rm -rf "$SBX_ROOT"
-    rm -f "$LOG_FILE"
-    rm -f "$LOCK_FILE"
-    rm -f /tmp/sbx_* 2>/dev/null || true
-    printf '  - 配置目录与日志缓存已清除\n'
-
-    # 4. 删除快捷指令
+    rm -f "$LOG_FILE" "$LOCK_FILE" /tmp/sbx_* 2>/dev/null || true
     rm -f "$SHORTCUT_PATH"
-    printf '  - 快捷指令已移除\n'
 
-    printf '\n%b[成功] SBX 已完全卸载，所有配置与残留已彻底清理！%b\n\n' "$GREEN$BOLD" "$NC"
+    printf '\n%b[OK] SBX 已完全卸载%b\n\n' "$GREEN$BOLD" "$NC"
     exit 0
 }
 
@@ -2155,27 +1397,18 @@ uninstall_all() {
 menu_logo() {
     clear_screen
     print_divider
-    printf '%b' "$PURPLE$BOLD"
-    cat <<'EOF'
-   _____ ____  _  __
-  / ___// __ )| |/ /   Sing-box & Linux VPS 工具箱
-  \__ \/ __  ||   /    版本: v5.0.0  |  快捷指令: sbx
- ___/ / /_/ //   |     纯净·轻量·一键运维
-/____/_____//_/|_|
-EOF
-    printf '%b' "$NC"
+    printf "  %bSBX %s%b · Sing-box & Linux VPS 工具箱 (%bsbx%b)\n" "$PURPLE$BOLD" "$SBX_VERSION" "$NC" "$GREEN" "$NC"
     print_divider
 
-    # 快捷状态摘要
     local os_brief cores load mem_pct sbx_stat
     os_brief=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2 | awk '{print $1" "$2}')
     [ -n "$os_brief" ] || os_brief="Linux"
     cores=$(nproc 2>/dev/null || echo "1")
-    load=$(awk '{print $1" "$2}' /proc/loadavg 2>/dev/null || echo "0.0")
+    load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "0.0")
     mem_pct=$(free 2>/dev/null | awk 'NR==2{printf "%.0f%%", $3*100/$2}')
     sbx_stat=$(sbx_service_status)
 
-    printf "  %b系统:%b %s (%s核) | %b负载:%b %s | %b内存:%b %s | %b代理:%b %b\n" \
+    printf "  %b系统:%b %s (%s核) | %b负载:%b %s | %b内存:%b %s | %b服务:%b %b\n" \
         "$CYAN" "$NC" "$os_brief" "$cores" \
         "$CYAN" "$NC" "$load" \
         "$CYAN" "$NC" "$mem_pct" \
@@ -2187,27 +1420,23 @@ show_main_menu() {
     menu_logo
 
     printf '  %b[ 系统维护 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_pair 1 "系统状态总览" 2 "系统更新与组件安装"
+    menu_pair 1 "系统状态总览" 2 "系统更新与组件"
     menu_pair 3 "系统垃圾清理" 4 "修改 Root 密码"
-    menu_single 5 "主机名与时区配置"
+    menu_single 5 "主机名与时区"
 
     printf '\n  %b[ 网络优化与安全 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_pair 6 "Swap 虚拟内存" 7 "DNS 优化与修改"
-    menu_pair 8 "TCP 调优与 BBR" 9 "BestTrace 回程测试"
-    menu_pair 10 "流媒体与 IP 质量" 11 "UFW 防火墙端口管理"
+    menu_pair 6 "Swap 虚拟内存" 7 "DNS 优化设置"
+    menu_pair 8 "TCP 调优与 BBR" 9 "BestTrace 回程"
+    menu_pair 10 "流媒体解锁检测" 11 "UFW 防火墙管理"
 
     printf '\n  %b[ Sing-box 代理 ]%b\n' "$CYAN$BOLD" "$NC"
     menu_pair 12 "VLESS-Reality 节点" 13 "TCP/UDP 端口转发"
     menu_pair 14 "WARP 出口与分流" 15 "核心与服务维护"
 
-    printf '\n  %b[ 脚本管理 ]%b\n' "$CYAN$BOLD" "$NC"
-    menu_single 16 "彻底卸载 SBX (清除全部配置与残留)"
-
-    printf '\n'
     print_divider
-    printf "  %b 0.%b 退出脚本\n\n" "$YELLOW" "$NC"
+    menu_pair 16 "彻底卸载 SBX" 0 "退出脚本"
 
-    _read_menu_choice MAIN_OPT "> 请选择操作 [0-16]: "
+    _read_menu_choice MAIN_OPT "> 选择 [0-16]: "
     case "$MAIN_OPT" in
         1) system_overview ;;
         2) system_update ;;
@@ -2225,14 +1454,8 @@ show_main_menu() {
         14) manage_warp ;;
         15) manage_service ;;
         16) uninstall_all ;;
-        0)
-            printf '\n%b感谢使用，再见！%b\n\n' "$GREEN" "$NC"
-            exit 0
-            ;;
-        *)
-            printf '\n%b[!] 选项无效，请输入 0-16 之间的数字。%b\n' "$RED" "$NC"
-            sleep 1
-            ;;
+        0) printf '\n%b感谢使用，再见！%b\n' "$GREEN" "$NC"; exit 0 ;;
+        *) printf '\n%b[!] 请输入 0-16%b\n' "$RED" "$NC"; sleep 0.6 ;;
     esac
 }
 
@@ -2240,16 +1463,13 @@ main() {
     set +x
     umask 077
     [ "$EUID" -eq 0 ] || {
-        printf '%b[!] 请以 root 用户身份运行此脚本。%b\n' "$RED" "$NC" >&2
+        printf '%b[!] 请以 root 身份运行%b\n' "$RED" "$NC" >&2
         exit 1
     }
     platform_detect
-
-    # 仅在非交互重定向且终端存在时切回 /dev/tty
     if [ ! -t 0 ] && [ -r /dev/tty ] && [ -t 1 ]; then
         exec < /dev/tty
     fi
-
     while true; do
         show_main_menu
     done

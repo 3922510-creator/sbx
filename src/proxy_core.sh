@@ -7,50 +7,35 @@ ensure_dirs() {
 
 sbx_service_status() {
     if [ ! -f "$SERVICE_SYSTEMD" ] && [ ! -f "$SERVICE_OPENRC" ]; then
-        printf '%b未部署%b' "$DIM" "$NC"
-        return 0
+        printf '%b未部署%b' "$DIM" "$NC"; return 0
     fi
     if [ "$INIT_SYS" = "systemd" ]; then
-        if systemctl is-active --quiet sbx.service 2>/dev/null; then
-            printf '%b运行中%b' "$GREEN" "$NC"
-        else
-            printf '%b已停止%b' "$RED" "$NC"
-        fi
+        systemctl is-active --quiet sbx.service 2>/dev/null && printf '%b运行中%b' "$GREEN" "$NC" || printf '%b已停止%b' "$RED" "$NC"
     elif [ "$INIT_SYS" = "openrc" ]; then
-        if rc-service sbx status 2>/dev/null | grep -q 'started'; then
-            printf '%b运行中%b' "$GREEN" "$NC"
-        else
-            printf '%b已停止%b' "$RED" "$NC"
-        fi
+        rc-service sbx status 2>/dev/null | grep -q 'started' && printf '%b运行中%b' "$GREEN" "$NC" || printf '%b已停止%b' "$RED" "$NC"
     else
         printf '%b未知%b' "$YELLOW" "$NC"
     fi
 }
 
 install_singbox_bin() {
-    if [ -x "$BIN_FILE" ]; then
-        printf 'Sing-box 核心已存在: %s\n' "$("$BIN_FILE" version 2>/dev/null | head -1)"
-        return 0
-    fi
-
-    printf '%b>>> 正在安装 Sing-box 官方最新核心...%b\n' "$CYAN" "$NC"
+    [ -x "$BIN_FILE" ] && return 0
+    printf '%b>>> 安装 Sing-box 核心...%b\n' "$CYAN" "$NC"
     local arch uname_m
     uname_m=$(uname -m)
     case "$uname_m" in
         x86_64|amd64) arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
         armv7*) arch="armv7" ;;
-        *) printf '%b[!] 不支持的 CPU 架构: %s%b\n' "$RED" "$uname_m" "$NC"; return 1 ;;
+        *) printf '%b[!] 不支持的架构: %s%b\n' "$RED" "$uname_m" "$NC"; return 1 ;;
     esac
 
-    local tag url tmp_dir
+    local tag url tmp_dir ver
     tag=$(curl -sL --connect-timeout 5 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name":' | head -1 | cut -d'"' -f4)
-    [ -n "$tag" ] || tag="v1.10.7"
-    local ver="${tag#v}"
-
+    [ -n "$tag" ] || tag="v1.11.4"
+    ver="${tag#v}"
     url="https://github.com/SagerNet/sing-box/releases/download/${tag}/sing-box-${ver}-linux-${arch}.tar.gz"
     tmp_dir=$(mktemp -d /tmp/sbx_core_XXXXXX)
-    printf '正在下载 %s ...\n' "$url"
     if curl -fsSL --connect-timeout 10 -o "${tmp_dir}/sb.tar.gz" "$url"; then
         tar -xzf "${tmp_dir}/sb.tar.gz" -C "$tmp_dir"
         local found_bin
@@ -58,12 +43,12 @@ install_singbox_bin() {
         if [ -n "$found_bin" ]; then
             install -m 755 "$found_bin" "$BIN_FILE"
             rm -rf "$tmp_dir"
-            printf '%b[成功] Sing-box 核心安装完成: %s%b\n' "$GREEN" "$("$BIN_FILE" version | head -1)" "$NC"
+            printf '%b[OK] Sing-box 已就绪: %s%b\n' "$GREEN" "$("$BIN_FILE" version | head -1)" "$NC"
             return 0
         fi
     fi
     rm -rf "$tmp_dir"
-    printf '%b[错误] 下载或安装 Sing-box 核心失败。%b\n' "$RED" "$NC"
+    printf '%b[!] 下载或安装 Sing-box 失败%b\n' "$RED" "$NC"
     return 1
 }
 
@@ -71,8 +56,7 @@ deploy_sbx_service() {
     if [ "$INIT_SYS" = "systemd" ]; then
         cat > "$SERVICE_SYSTEMD" <<EOF
 [Unit]
-Description=Sing-box Service (Managed by SBX)
-Documentation=https://sing-box.sagernet.org
+Description=Sing-box Service (SBX)
 After=network.target nss-lookup.target
 
 [Service]
@@ -99,11 +83,7 @@ command_background="yes"
 pidfile="/run/sbx.pid"
 output_log="${LOG_FILE}"
 error_log="${LOG_FILE}"
-
-depend() {
-    need net
-    after firewall
-}
+depend() { need net; after firewall; }
 EOF
         chmod 755 "$SERVICE_OPENRC"
         rc-update add sbx default >/dev/null 2>&1 || true
@@ -115,189 +95,117 @@ init_sbx_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" <<'EOF'
 {
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
+  "log": { "level": "warn", "timestamp": true },
   "inbounds": [],
   "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    }
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" }
   ],
   "route": {
     "auto_detect_interface": true,
-    "rules": [
-      {
-        "action": "sniff"
-      }
-    ],
+    "rules": [{ "action": "sniff" }],
     "final": "direct"
   }
 }
 EOF
     fi
-    if [ ! -f "$STATE_FILE" ]; then
-        echo '{"format": 5, "nodes": {}}' > "$STATE_FILE"
-    fi
+    [ -f "$STATE_FILE" ] || echo '{"format": 5, "nodes": {}}' > "$STATE_FILE"
 }
 
 sbx_backup_config() {
     ensure_dirs
     [ -f "$CONFIG_FILE" ] || return 0
-    local ts
-    ts=$(date +"%Y%m%d_%H%M%S")
-    cp -pf "$CONFIG_FILE" "${BACKUP_DIR}/config_${ts}.json" 2>/dev/null || true
-    # 最多保留 10 个备份
+    cp -pf "$CONFIG_FILE" "${BACKUP_DIR}/config_$(date +'%Y%m%d_%H%M%S').json" 2>/dev/null || true
     local old_baks
     old_baks=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | tail -n +11)
-    if [ -n "$old_baks" ]; then
-        rm -f $old_baks 2>/dev/null || true
-    fi
+    [ -n "$old_baks" ] && rm -f $old_baks 2>/dev/null || true
 }
 
 sbx_check_config() {
-    if [ ! -x "$BIN_FILE" ]; then return 0; fi
+    [ -x "$BIN_FILE" ] || return 0
     "$BIN_FILE" check -c "$CONFIG_FILE" >/dev/null 2>&1
 }
 
-# 统一安全写入与核心预检函数：
-# 1. 只有 candidate 通过 sing-box check，才允许覆盖 CONFIG_FILE
-# 2. 预检不通过时，打印完整错误、清除临时文件，原配置 100% 不动
-# 3. 覆盖后启动，若服务异常拉起失败，自动回滚上一次备份
 sbx_apply_config_safe() {
     local candidate="$1"
     if [ ! -s "$candidate" ]; then
-        printf '%b[错误] 待应用配置文件为空。%b\n' "$RED" "$NC"
+        printf '%b[!] 待写入配置为空%b\n' "$RED" "$NC"
         rm -f "$candidate"
         return 1
     fi
-
-    # 1. 核心预检
     local check_err
     if ! check_err=$("$BIN_FILE" check -c "$candidate" 2>&1); then
-        printf '\n%b[核心预检失败] 节点配置未通过 Sing-box 核心校验，已拒绝写入，原配置未做任何修改：%b\n' "$RED$BOLD" "$NC"
-        printf '%b%s%b\n' "$YELLOW" "$check_err" "$NC"
+        printf '\n%b[核心预检失败] 配置未通过 Sing-box 校验，原配置未改动:%b\n%b%s%b\n' "$RED$BOLD" "$NC" "$YELLOW" "$check_err" "$NC"
         rm -f "$candidate"
         return 1
     fi
-
-    # 2. 备份原配置
     sbx_backup_config
-
-    # 3. 原子替换
     mv -f "$candidate" "$CONFIG_FILE"
-
-    # 4. 重启服务
     sbx_svc_action restart >/dev/null 2>&1 || true
-
-    # 5. 服务拉起校验（若拉起失败，自动回滚最近一次备份）
     sleep 0.5
     if [ "$INIT_SYS" = "systemd" ] && ! systemctl is-active --quiet sbx.service 2>/dev/null; then
         local latest_bak
         latest_bak=$(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null | head -1)
         if [ -n "$latest_bak" ]; then
-            printf '\n%b[警告] 服务启动异常，正在自动回滚至上一版本配置...%b\n' "$RED" "$NC"
+            printf '\n%b[!] 服务启动异常，已自动回滚至上一版本%b\n' "$RED" "$NC"
             cp -pf "$latest_bak" "$CONFIG_FILE"
             sbx_svc_action restart >/dev/null 2>&1 || true
         fi
         return 1
     fi
-
     return 0
 }
 
 sbx_svc_action() {
     local act="$1"
-    if [ "$INIT_SYS" = "systemd" ]; then
-        systemctl "$act" sbx.service
-    elif [ "$INIT_SYS" = "openrc" ]; then
-        rc-service sbx "$act"
-    fi
+    [ "$INIT_SYS" = "systemd" ] && systemctl "$act" sbx.service
+    [ "$INIT_SYS" = "openrc" ] && rc-service sbx "$act"
 }
 
 manage_service() {
     while true; do
-        menu_header "Sing-box 核心与服务维护"
-        printf "  %b服务运行状态:%b  %b\n" "$CYAN" "$NC" "$(sbx_service_status)"
-        printf "  %b配置文件路径:%b  %s\n" "$CYAN" "$NC" "$CONFIG_FILE"
-        printf "  %b核心程序路径:%b  %s\n\n" "$CYAN" "$NC" "$BIN_FILE"
+        menu_header "Sing-box 核心与服务"
+        local ver
+        ver=$([ -x "$BIN_FILE" ] && "$BIN_FILE" version 2>/dev/null | head -1 | awk '{print $3}' || echo "未安装")
+        printf "  %b状态:%b %b  |  %b核心:%b %s\n" "$CYAN" "$NC" "$(sbx_service_status)" "$CYAN" "$NC" "$ver"
+        printf "  %b配置:%b %s\n\n" "$CYAN" "$NC" "$CONFIG_FILE"
 
-        menu_single 1 "启动 sing-box (sbx) 服务"
-        menu_single 2 "停止 sing-box (sbx) 服务"
-        menu_single 3 "重启 sing-box (sbx) 服务"
-        menu_single 4 "查看实时运行日志"
-        menu_single 5 "校验当前配置文件完整性"
-        menu_single 6 "从历史备份中回滚配置"
-        menu_single 7 "更新 / 重装 Sing-box 核心程序"
-        menu_single 0 "返回主菜单"
+        menu_pair 1 "启动服务" 2 "停止服务"
+        menu_pair 3 "重启服务" 4 "查看日志"
+        menu_pair 5 "校验配置" 6 "回滚备份"
+        menu_single 7 "更新 / 重装核心"
+        menu_single 0 "返回"
 
-        _read_menu_choice svc_opt "> 请选择操作 [0-7]: "
+        _read_menu_choice svc_opt "> 选择 [0-7]: "
         case "$svc_opt" in
             1) sbx_svc_action start; pause_for_enter ;;
             2) sbx_svc_action stop; pause_for_enter ;;
             3) sbx_svc_action restart; pause_for_enter ;;
             4)
-                printf '\n%b>>> 最近 30 行服务日志 (Ctrl+C 退出)：%b\n' "$CYAN" "$NC"
-                if [ "$INIT_SYS" = "systemd" ]; then
-                    journalctl -u sbx.service -n 30 --no-pager
-                else
-                    tail -n 30 "$LOG_FILE" 2>/dev/null || echo "暂无日志。"
-                fi
-                pause_for_enter
-                ;;
+                printf '\n'
+                [ "$INIT_SYS" = "systemd" ] && journalctl -u sbx.service -n 30 --no-pager || tail -n 30 "$LOG_FILE" 2>/dev/null
+                pause_for_enter ;;
             5)
                 printf '\n'
-                if "$BIN_FILE" check -c "$CONFIG_FILE"; then
-                    printf '\n%b[成功] 配置文件校验完全通过！%b\n' "$GREEN" "$NC"
-                else
-                    printf '\n%b[错误] 配置文件存在语法或参数错误！%b\n' "$RED" "$NC"
-                fi
-                pause_for_enter
-                ;;
+                "$BIN_FILE" check -c "$CONFIG_FILE" && printf '%b[OK] 配置校验通过%b\n' "$GREEN" "$NC" || printf '%b[!] 配置存在错误%b\n' "$RED" "$NC"
+                pause_for_enter ;;
             6)
-                local baks choice i=1 b_list=()
-                while IFS= read -r f; do
-                    [ -n "$f" ] || continue
-                    b_list+=("$f")
-                done < <(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null)
-
-                if [ ${#b_list[@]} -eq 0 ]; then
-                    printf '\n%b[!] 暂无可用历史备份。%b\n' "$YELLOW" "$NC"
-                    pause_for_enter
-                    continue
-                fi
-
-                printf '\n%b历史备份列表：%b\n' "$CYAN" "$NC"
-                for f in "${b_list[@]}"; do
-                    printf "  %b%d)%b %s\n" "$GREEN" "$i" "$NC" "$(basename "$f")"
-                    i=$((i + 1))
-                done
+                local choice i=1 b_list=() f
+                while IFS= read -r f; do [ -n "$f" ] && b_list+=("$f"); done < <(ls -1t "${BACKUP_DIR}"/config_*.json 2>/dev/null)
+                [ ${#b_list[@]} -gt 0 ] || { printf '\n%b[!] 暂无备份%b\n' "$YELLOW" "$NC"; pause_for_enter; continue; }
                 printf '\n'
-                read -rp "  请选择要恢复的备份编号: " choice
-                choice="${choice// /}"
+                for f in "${b_list[@]}"; do printf "  %b%d.%b %s\n" "$GREEN" "$i" "$NC" "$(basename "$f")"; i=$((i + 1)); done
+                read -rp "  选择备份编号: " choice; choice="${choice// /}"
                 if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#b_list[@]}" ]; then
                     local target="${b_list[$((choice - 1))]}"
-                    if confirm_action "从 $(basename "$target") 恢复配置？"; then
+                    if confirm_action "恢复 $(basename "$target")？"; then
                         cp -pf "$target" "$CONFIG_FILE"
                         sbx_svc_action restart >/dev/null 2>&1 || true
-                        printf '%b[成功] 配置已还原并重启服务！%b\n' "$GREEN" "$NC"
-                        pause_for_enter
+                        printf '%b[OK] 已恢复并重启%b\n' "$GREEN" "$NC"; pause_for_enter
                     fi
-                fi
-                ;;
-            7)
-                rm -f "$BIN_FILE"
-                install_singbox_bin
-                pause_for_enter
-                ;;
+                fi ;;
+            7) rm -f "$BIN_FILE"; install_singbox_bin; pause_for_enter ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }

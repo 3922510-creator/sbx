@@ -2,58 +2,56 @@
 
 _find_available_port() {
     local p="${1:-443}"
-    while true; do
-        if ! ss -tlnu 2>/dev/null | awk '{print $5}' | awk -F: '{print $NF}' | grep -wq "$p"; then
-            echo "$p"
-            return 0
-        fi
+    while [ "$p" -le 65535 ]; do
+        ss -tlnu 2>/dev/null | awk '{print $5}' | awk -F: '{print $NF}' | grep -wq "$p" || { echo "$p"; return 0; }
         p=$((p + 1))
-        [ "$p" -le 65535 ] || break
     done
     echo "4433"
 }
 
 _generate_reality_keys() {
-    local out
+    local out priv pub
     out=$("$BIN_FILE" generate reality-keypair 2>/dev/null)
-    local priv pub
     priv=$(echo "$out" | awk '/PrivateKey:/{print $2}' | tr -d '\r')
     pub=$(echo "$out" | awk '/PublicKey:/{print $2}' | tr -d '\r')
     printf '%s|%s' "$priv" "$pub"
 }
 
+_is_node_warp() {
+    local tag="$1"
+    [ -f "$STATE_FILE" ] || return 1
+    jq -e --arg t "$tag" '(.warp_nodes // []) | index($t) != null' "$STATE_FILE" >/dev/null 2>&1
+}
+
 add_reality_node() {
-    menu_header "搭建 / 添加 VLESS-Reality 节点"
+    menu_header "添加 VLESS-Reality 节点"
     acquire_lock || return 1
     install_singbox_bin || return 1
     init_sbx_config
     deploy_sbx_service
 
-    printf '  %b[1/5] 设置节点端口%b\n' "$CYAN" "$NC"
-    local rec_port port
+    local rec_port port sni sni_opt name
     rec_port=$(_find_available_port 443)
-    read -rp "  请输入监听端口 [默认 ${rec_port}]: " port
-    port="${port// /}"
-    port="${port:-$rec_port}"
+    read -rp "  1. 监听端口 [默认 ${rec_port}]: " port
+    port="${port// /}"; port="${port:-$rec_port}"
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
-        printf '%b[!] 端口号不合法。%b\n' "$RED" "$NC"; pause_for_enter; return 1;
+        printf '%b[!] 端口无效%b\n' "$RED" "$NC"; pause_for_enter; return 1;
     }
 
-    printf '\n  %b[2/5] 设置伪装域名 (SNI)%b\n' "$CYAN" "$NC"
-    printf '  常用推荐: 1) addons.mozilla.org  2) gateway.icloud.com  3) www.microsoft.com\n'
-    local sni sni_opt
-    read -rp "  请选择或输入 SNI [直接回车默认 addons.mozilla.org]: " sni_opt
+    printf '  2. 伪装域名: 1) addons.mozilla.org  2) gateway.icloud.com  3) www.microsoft.com\n'
+    read -rp "     选择或输入 SNI [默认 1]: " sni_opt
     sni_opt="${sni_opt// /}"
     case "$sni_opt" in
-        1) sni="addons.mozilla.org" ;;
-        2) sni="gateway.icloud.com" ;;
-        3) sni="www.microsoft.com" ;;
-        "") sni="addons.mozilla.org" ;;
-        *) sni="$sni_opt" ;;
+        1|"") sni="addons.mozilla.org" ;;
+        2)    sni="gateway.icloud.com" ;;
+        3)    sni="www.microsoft.com" ;;
+        *)    sni="$sni_opt" ;;
     esac
 
-    printf '\n  %b[3/5] 生成安全密钥与认证凭据...%b\n' "$CYAN" "$NC"
-    local uuid keys priv_key pub_key short_id tag
+    read -rp "  3. 节点备注 [默认 Reality-${port}]: " name
+    name="${name// /}"; name="${name:-Reality-${port}}"
+
+    local uuid keys priv_key pub_key short_id tag tmp_conf tmp_state
     uuid=$("$BIN_FILE" generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null)
     keys=$(_generate_reality_keys)
     priv_key=$(echo "$keys" | cut -d'|' -f1)
@@ -61,112 +59,69 @@ add_reality_node() {
     short_id=$(openssl rand -hex 8 2>/dev/null || echo "1a2b3c4d5e6f7a8b")
     tag="vless-reality-${port}"
 
-    printf '\n  %b[4/5] 设置节点备注名称%b\n' "$CYAN" "$NC"
-    local name
-    read -rp "  请输入节点备注名称 [默认 Reality-${port}]: " name
-    name="${name// /}"
-    name="${name:-Reality-${port}}"
-
-    # 写入配置并交由核心预检引擎安全应用
-    local tmp_conf
     tmp_conf=$(mktemp /tmp/sbx_conf_XXXXXX)
-    jq --arg tag "$tag" \
-       --argjson port "$port" \
-       --arg uuid "$uuid" \
-       --arg sni "$sni" \
-       --arg priv "$priv_key" \
-       --arg sid "$short_id" \
-       '.inbounds = [.inbounds[] | select(.tag != $tag)] + [{
-          "type": "vless",
-          "tag": $tag,
-          "listen": "::",
-          "listen_port": $port,
-          "tcp_fast_open": true,
-          "users": [{
-            "uuid": $uuid,
-            "flow": "xtls-rprx-vision"
-          }],
-          "tls": {
+    jq --arg tag "$tag" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg priv "$priv_key" --arg sid "$short_id" '
+      .inbounds = [.inbounds[] | select(.tag != $tag)] + [{
+        "type": "vless",
+        "tag": $tag,
+        "listen": "::",
+        "listen_port": $port,
+        "tcp_fast_open": true,
+        "users": [{ "uuid": $uuid, "flow": "xtls-rprx-vision" }],
+        "tls": {
+          "enabled": true,
+          "server_name": $sni,
+          "reality": {
             "enabled": true,
-            "server_name": $sni,
-            "reality": {
-              "enabled": true,
-              "handshake": {
-                "server": $sni,
-                "server_port": 443
-              },
-              "private_key": $priv,
-              "short_id": [$sid]
-            }
+            "handshake": { "server": $sni, "server_port": 443 },
+            "private_key": $priv,
+            "short_id": [$sid]
           }
-       }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
+        }
+      }]' "$CONFIG_FILE" > "$tmp_conf" 2>/dev/null
 
-    if ! sbx_apply_config_safe "$tmp_conf"; then
-        pause_for_enter
-        return 1
-    fi
+    sbx_apply_config_safe "$tmp_conf" || { pause_for_enter; return 1; }
 
-    # 预检通过并应用成功后，持久化元数据
-    local tmp_state
     tmp_state=$(mktemp /tmp/sbx_state_XXXXXX)
-    jq --arg tag "$tag" \
-       --arg name "$name" \
-       --argjson port "$port" \
-       --arg uuid "$uuid" \
-       --arg sni "$sni" \
-       --arg pub "$pub_key" \
-       --arg sid "$short_id" \
-       '.nodes[$tag] = {
-          "name": $name,
-          "port": $port,
-          "uuid": $uuid,
-          "sni": $sni,
-          "pub_key": $pub,
-          "short_id": $sid,
-          "created_at": (now | todate)
-       }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
+    jq --arg tag "$tag" --arg name "$name" --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg pub "$pub_key" --arg sid "$short_id" '
+      .nodes[$tag] = {
+        "name": $name, "port": $port, "uuid": $uuid, "sni": $sni,
+        "pub_key": $pub, "short_id": $sid, "created_at": (now | todate)
+      }' "$STATE_FILE" > "$tmp_state" 2>/dev/null && mv "$tmp_state" "$STATE_FILE"
     rm -f "$tmp_state"
 
-    printf '\n%b[5/5] 节点搭建成功！正在生成节点链接...%b\n\n' "$GREEN" "$NC"
+    printf '\n%b[OK] 节点创建成功%b\n' "$GREEN" "$NC"
     _show_node_by_tag "$tag"
     pause_for_enter
 }
 
 _show_node_by_tag() {
-    local tag="$1"
-    local node_data
+    local tag="$1" node_data
     node_data=$(jq -r --arg t "$tag" '.nodes[$t] // empty' "$STATE_FILE" 2>/dev/null)
-    [ -n "$node_data" ] || { printf '%b[!] 找不到该节点数据。%b\n' "$RED" "$NC"; return 1; }
+    [ -n "$node_data" ] || { printf '%b[!] 节点不存在%b\n' "$RED" "$NC"; return 1; }
 
-    local name port uuid sni pub_key short_id ip_data ip
+    local name port uuid sni pub_key short_id ip link route_mode
     name=$(echo "$node_data" | jq -r '.name')
     port=$(echo "$node_data" | jq -r '.port')
     uuid=$(echo "$node_data" | jq -r '.uuid')
     sni=$(echo "$node_data" | jq -r '.sni')
     pub_key=$(echo "$node_data" | jq -r '.pub_key')
     short_id=$(echo "$node_data" | jq -r '.short_id')
+    ip=$(_get_public_ip | cut -d'|' -f1)
+    [ -n "$ip" ] || ip="服务器IP"
+    _is_node_warp "$tag" && route_mode="${YELLOW}指定走 WARP${NC}" || route_mode="${CYAN}默认分流/直连${NC}"
 
-    ip_data=$(_get_public_ip)
-    ip=$(echo "$ip_data" | cut -d'|' -f1)
-    [ -n "$ip" ] || ip="您的服务器公网IP"
-
-    local link
     link="vless://${uuid}@${ip}:${port}?security=reality&sni=${sni}&pbk=${pub_key}&sid=${short_id}&type=tcp&flow=xtls-rprx-vision&fp=chrome#${name}"
 
     print_divider
-    printf "  %b节点名称:%b  %s\n" "$CYAN" "$NC" "$name"
-    printf "  %b协议类型:%b  VLESS-Reality + Vision\n" "$CYAN" "$NC"
-    printf "  %b连接地址:%b  %s:%s\n" "$CYAN" "$NC" "$ip" "$port"
-    printf "  %b用户 UUID:%b %s\n" "$CYAN" "$NC" "$uuid"
-    printf "  %b伪装域名:%b  %s\n" "$CYAN" "$NC" "$sni"
-    printf "  %bPublic Key:%b%s\n" "$CYAN" "$NC" "$pub_key"
-    printf "  %bShort ID:%b  %s\n" "$CYAN" "$NC" "$short_id"
+    printf "  %b名称:%b %s  |  %b端口:%b %s  |  %b出站:%b %b\n" "$CYAN" "$NC" "$name" "$CYAN" "$NC" "$port" "$CYAN" "$NC" "$route_mode"
+    printf "  %b地址:%b %s  |  %bSNI :%b %s\n" "$CYAN" "$NC" "$ip" "$CYAN" "$NC" "$sni"
+    printf "  %bUUID:%b %s\n" "$CYAN" "$NC" "$uuid"
+    printf "  %bPBK :%b %s  |  %bSID:%b %s\n" "$CYAN" "$NC" "$pub_key" "$CYAN" "$NC" "$short_id"
     print_divider
-    printf "  %b分享链接 (直接复制导入客户端):%b\n" "$YELLOW$BOLD" "$NC"
-    printf "  %s\n\n" "$link"
-
+    printf "  %b分享链接:%b\n  %s\n" "$YELLOW$BOLD" "$NC" "$link"
     if command -v qrencode >/dev/null 2>&1; then
-        printf "  %b二维码:%b\n" "$CYAN" "$NC"
+        printf "\n"
         qrencode -t ANSIUTF8 "$link" 2>/dev/null || true
     fi
 }
@@ -175,19 +130,15 @@ list_reality_nodes() {
     init_sbx_config
     local count
     count=$(jq '.nodes | length' "$STATE_FILE" 2>/dev/null || echo 0)
-    if [ "$count" -eq 0 ]; then
-        printf '\n  %b当前暂无已配置的 Reality 节点。%b\n' "$YELLOW" "$NC"
-        return 1
-    fi
+    [ "$count" -gt 0 ] || { printf '  %b暂无节点%b\n' "$DIM" "$NC"; return 1; }
 
-    local tags=() i=1
+    local i=1 t n p w_badge
     while IFS= read -r t; do
         [ -n "$t" ] || continue
-        tags+=("$t")
-        local n p
         n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
         p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
-        printf "  %b%d.%b %-20s  (端口: %s)\n" "$GREEN" "$i" "$NC" "$n" "$p"
+        _is_node_warp "$t" && w_badge=" ${YELLOW}[WARP]${NC}" || w_badge=""
+        printf "  %b%d.%b %-18s (端口: %s)%b\n" "$GREEN" "$i" "$NC" "$n" "$p" "$w_badge"
         i=$((i + 1))
     done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
 }
@@ -195,81 +146,62 @@ list_reality_nodes() {
 manage_reality() {
     while true; do
         menu_header "VLESS-Reality 节点管理"
-        printf "  %b当前节点列表:%b\n" "$CYAN" "$NC"
-        list_reality_nodes
+        list_reality_nodes || true
         printf '\n'
+        menu_pair 1 "添加节点" 2 "查看链接/二维码"
+        menu_pair 3 "检测端口状态" 4 "删除节点"
+        menu_single 0 "返回"
 
-        menu_single 1 "快速添加新的 VLESS-Reality 节点"
-        menu_single 2 "查看指定节点链接与二维码"
-        menu_single 3 "测试节点连通性 (本地端口检测)"
-        menu_single 4 "删除节点"
-        menu_single 0 "返回主菜单"
-
-        _read_menu_choice rel_opt "> 请选择操作 [0-4]: "
+        _read_menu_choice rel_opt "> 选择 [0-4]: "
         case "$rel_opt" in
             1) add_reality_node ;;
             2)
-                local tags=() t
+                local tags=() t idx
                 while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
                 [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
-                printf '\n'
-                read -rp "  请输入要查看的节点编号 [1-${#tags[@]}]: " idx
-                idx="${idx// /}"
+                read -rp "  节点编号 [1-${#tags[@]}]: " idx; idx="${idx// /}"
                 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#tags[@]}" ]; then
-                    printf '\n'
                     _show_node_by_tag "${tags[$((idx - 1))]}"
                     pause_for_enter
-                fi
-                ;;
+                fi ;;
             3)
-                local tags=() t
-                while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
-                [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
-                printf '\n%b正在检测节点端口监听状态...%b\n' "$CYAN" "$NC"
-                for t in "${tags[@]}"; do
-                    local n p
-                    n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
-                    p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
-                    if ss -tln | grep -wq ":$p"; then
-                        printf "  [%s] 端口 %s -> %b正常监听中%b\n" "$n" "$p" "$GREEN" "$NC"
-                    else
-                        printf "  [%s] 端口 %s -> %b未在监听 / 核心未启动%b\n" "$n" "$p" "$RED" "$NC"
-                    fi
-                done
-                pause_for_enter
-                ;;
-            4)
-                local tags=() t
+                local tags=() t n p
                 while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
                 [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
                 printf '\n'
-                read -rp "  请输入要删除的节点编号 [1-${#tags[@]}]: " idx
-                idx="${idx// /}"
+                for t in "${tags[@]}"; do
+                    n=$(jq -r --arg t "$t" '.nodes[$t].name' "$STATE_FILE")
+                    p=$(jq -r --arg t "$t" '.nodes[$t].port' "$STATE_FILE")
+                    ss -tln | grep -wq ":$p" && printf "  [%s] :%s -> %b监听中%b\n" "$n" "$p" "$GREEN" "$NC" || printf "  [%s] :%s -> %b未监听%b\n" "$n" "$p" "$RED" "$NC"
+                done
+                pause_for_enter ;;
+            4)
+                local tags=() t idx
+                while IFS= read -r t; do [ -n "$t" ] && tags+=("$t"); done < <(jq -r '.nodes | keys[]' "$STATE_FILE" 2>/dev/null)
+                [ ${#tags[@]} -gt 0 ] || { pause_for_enter; continue; }
+                read -rp "  删除节点编号 [1-${#tags[@]}]: " idx; idx="${idx// /}"
                 if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#tags[@]}" ]; then
-                    local sel_tag="${tags[$((idx - 1))]}"
-                    local sel_name
+                    local sel_tag="${tags[$((idx - 1))]}" sel_name
                     sel_name=$(jq -r --arg t "$sel_tag" '.nodes[$t].name' "$STATE_FILE")
-                    if confirm_action "确认删除节点: ${sel_name}？"; then
+                    if confirm_action "删除节点 ${sel_name}？"; then
                         acquire_lock || continue
-                        # 从 config.json 移除候选并进行安全核心预检
-                        local tmp_c tmp_s
-                        tmp_c=$(mktemp /tmp/sbx_c_XXXXXX)
-                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c"
-                        if ! sbx_apply_config_safe "$tmp_c"; then
-                            pause_for_enter
-                            continue
-                        fi
-                        # 预检通过并应用后，同步从 state.json 移除
+                        local tmp_s tmp_c1 tmp_c2
                         tmp_s=$(mktemp /tmp/sbx_s_XXXXXX)
-                        jq --arg tag "$sel_tag" 'del(.nodes[$tag])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
-                        rm -f "$tmp_s"
-                        printf '%b[成功] 节点已删除！%b\n' "$GREEN" "$NC"
+                        jq --arg tag "$sel_tag" 'del(.nodes[$tag]) | .warp_nodes = ([.warp_nodes[]? | select(. != $tag)])' "$STATE_FILE" > "$tmp_s" && mv "$tmp_s" "$STATE_FILE"
+                        tmp_c1=$(mktemp /tmp/sbx_c1_XXXXXX)
+                        tmp_c2=$(mktemp /tmp/sbx_c2_XXXXXX)
+                        jq --arg tag "$sel_tag" '.inbounds = [.inbounds[] | select(.tag != $tag)]' "$CONFIG_FILE" > "$tmp_c1"
+                        if type _sync_warp_node_rules >/dev/null 2>&1; then
+                            _sync_warp_node_rules "$tmp_c1" "$tmp_c2"
+                            rm -f "$tmp_c1"
+                        else
+                            mv "$tmp_c1" "$tmp_c2"
+                        fi
+                        sbx_apply_config_safe "$tmp_c2" && printf '%b[OK] 节点已删除%b\n' "$GREEN" "$NC"
                         pause_for_enter
                     fi
-                fi
-                ;;
+                fi ;;
             0) return 0 ;;
-            *) sleep 1 ;;
         esac
     done
 }
