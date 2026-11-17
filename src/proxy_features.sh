@@ -73,6 +73,63 @@ _warp_entry() {
 
 _has_warp_outbound() { _warp_entry >/dev/null; }
 
+_warp_family() {
+    jq -er '(.endpoints[0].address // .outbounds[0].local_address // []) | [flatten[] | contains(":")] | unique |
+      if . == [false, true] then "dual" elif . == [false] then "ipv4" elif . == [true] then "ipv6" else empty end'
+}
+
+_warp_family_label() {
+    case "$1" in
+        ipv4) printf '仅 IPv4' ;;
+        ipv6) printf '仅 IPv6' ;;
+        dual) printf 'IPv4 + IPv6' ;;
+        *) printf '未知' ;;
+    esac
+}
+
+_warp_endpoint_for_family() {
+    jq -e --arg family "$1" --argjson pool "$2" '
+      ($pool | map(select(contains(":") | not))) as $v4 |
+      ($pool | map(select(contains(":")))) as $v6 |
+      if ($family != "ipv6" and ($v4 | length) == 0) or ($family != "ipv4" and ($v6 | length) == 0) then
+        error("WARP 未注册所选地址族，请先重新接入")
+      elif $family == "ipv4" then .address = $v4 | .peers[0].allowed_ips = ["0.0.0.0/0"]
+      elif $family == "ipv6" then .address = $v6 | .peers[0].allowed_ips = ["::/0"]
+      elif $family == "dual" then .address = ($v4 + $v6) | .peers[0].allowed_ips = ["0.0.0.0/0", "::/0"]
+      else error("无效的 WARP 地址族") end
+    '
+}
+
+_warp_apply_family() (
+    local family="$1" endpoint="$2" pool="$3" config state
+    endpoint=$(_warp_endpoint_for_family "$family" "$pool" <<< "$endpoint") || exit 1
+    config=$(mktemp "${CONFIG_FILE}.XXXXXX") || exit 1
+    trap 'rm -f "$config" "${state:-}"' EXIT
+    state=$(mktemp "${STATE_FILE}.XXXXXX") || exit 1
+    jq --slurpfile ep /dev/fd/3 '
+      .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + $ep) |
+      .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
+    ' 3<<< "$endpoint" "$CONFIG_FILE" > "$config" &&
+        jq --argjson pool "$pool" '.warp_address_pool = $pool' "$STATE_FILE" > "$state" &&
+        sbx_apply_config_safe "$config" "$state"
+)
+
+_warp_change_family() (
+    acquire_lock || exit 1
+    local entry endpoint pool current
+    entry=$(_warp_entry) || { printf '请先接入 WARP。\n'; exit 1; }
+    endpoint=$(jq -ce '.endpoints[0] | select(.type == "wireguard" and (.peers | length) == 1)' <<< "$entry") || {
+        printf '当前不是 SBX 支持的单对端 WireGuard 配置，请先重新接入。\n'; exit 1;
+    }
+    current=$(_warp_family <<< "$entry") || exit 1
+    [[ "$current" != "$1" ]] || exit 0
+    pool=$(jq -ce --slurpfile state "$STATE_FILE" '
+      .address as $active | [$active[], ($state[0].warp_address_pool // [])[] as $saved |
+        select(all($active[]; contains(":") != ($saved | contains(":")))) | $saved] | unique
+    ' <<< "$endpoint") || exit 1
+    _warp_apply_family "$1" "$endpoint" "$pool"
+)
+
 _show_warp_addresses() {
     local addresses
     addresses=$(_warp_entry | jq -r '(.endpoints[0].address // .outbounds[0].local_address // []) | if type == "array" then join(" · ") else . end')
@@ -198,7 +255,9 @@ _show_warp_rules_detail() {
 
 _probe_warp() (
     umask 077
-    local dir pid port attempt trace ip colo flag
+    local dir pid port attempt family version target result results=() families=()
+    family=$(_warp_entry | _warp_family) || family=dual
+    case "$family" in ipv4) families=(4) ;; ipv6) families=(6) ;; *) families=(4 6) ;; esac
     dir=$(mktemp -d /tmp/sbx_warp_probe_XXXXXX) || exit 1
     trap 'if [ -n "${pid:-}" ]; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fi; rm -rf "$dir"' EXIT
     trap 'exit 1' HUP INT TERM
@@ -219,19 +278,38 @@ _probe_warp() (
         printf '%b[!] WARP 测试进程启动失败，请检查核心版本与端点配置%b\n' "$RED" "$NC" >&2
         exit 1
     fi
-    trace=$(curl -qfsS --noproxy '' --proxy "socks5h://127.0.0.1:$port" --connect-timeout 5 --max-time 12 \
-      https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || {
-        printf '%b[!] 无法通过 WARP 访问 Cloudflare Trace%b\n' "$RED" "$NC" >&2; exit 1;
-    }
+    local verified=0
+    for version in "${families[@]}"; do
+        case "$version" in 4) target=1.1.1.1 ;; 6) target='[2606:4700:4700::1111]' ;; esac
+        if result=$(_warp_trace "$port" "$version" "$target"); then
+            verified=1
+            results+=("IPv$version $result")
+        else
+            results+=("IPv$version 未确认")
+        fi
+    done
+    if [ "$verified" -eq 0 ]; then
+        printf '%b[!] Trace 未确认流量经过 WARP: %s%b\n' "$RED" "${results[*]}" "$NC" >&2
+        exit 1
+    fi
+    printf '%s\n' "${results[*]}"
+)
+
+_warp_trace() {
+    local trace ip colo flag
+    # Force the destination family; curl -4/-6 alone only selects the SOCKS connection family.
+    trace=$(curl -qfsS --noproxy '' --proxy "socks5h://127.0.0.1:$1" --connect-timeout 5 --max-time 10 \
+      --connect-to "one.one.one.one:443:$3:443" https://one.one.one.one/cdn-cgi/trace 2>/dev/null) || return 1
     ip=$(awk -F= '/^ip=/{print $2; exit}' <<< "$trace")
     colo=$(awk -F= '/^colo=/{print $2; exit}' <<< "$trace")
     flag=$(awk -F= '/^warp=/{print $2; exit}' <<< "$trace")
-    if [[ ! "$ip" =~ ^[0-9A-Fa-f:.]+$ || ! "$colo" =~ ^[A-Z]{3}$ || ! "$flag" =~ ^(on|plus)$ ]]; then
-        printf '%b[!] Trace 未确认流量经过 WARP，不显示为成功%b\n' "$RED" "$NC" >&2
-        exit 1
-    fi
-    printf '%s  |  Cloudflare: %s  |  WARP: %s\n' "$ip" "$colo" "$flag"
-)
+    [[ "$colo" =~ ^[A-Z]{3}$ && "$flag" =~ ^(on|plus)$ ]] || return 1
+    case "$2" in
+        4) [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1 ;;
+        6) [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ && "$ip" == *:* ]] || return 1 ;;
+    esac
+    printf '%s (%s, warp=%s)' "$ip" "$colo" "$flag"
+}
 
 _test_warp_connectivity() {
     _show_warp_addresses
@@ -255,7 +333,8 @@ _warp_registration_endpoint() {
 }
 
 _register_warp() (
-    local keys priv pub id payload response endpoint candidate
+    local keys priv pub id payload response endpoint family pool
+    family=$(_warp_entry | _warp_family) || family=""
     keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null) || exit 1
     read -r priv pub < <(awk '/^PrivateKey:/{p=$2} /^PublicKey:/{q=$2} END{print p, q}' <<< "$keys")
     if [ -z "$priv" ] || [ -z "$pub" ]; then
@@ -272,12 +351,11 @@ _register_warp() (
         printf '%b[!] WARP 注册失败或返回缺少地址/公钥，原配置未改动%b\n' "$RED" "$NC"
         exit 1
     fi
-    candidate=$(mktemp "${CONFIG_FILE}.XXXXXX") || exit 1
-    trap 'rm -f "$candidate"' EXIT
-    jq --slurpfile ep /dev/fd/3 '
-      .endpoints = ([.endpoints[]? | select(.tag != "warp-out")] + $ep) |
-      .outbounds = [.outbounds[]? | select(.tag != "warp-out")]
-    ' 3<<< "$endpoint" "$CONFIG_FILE" > "$candidate" && sbx_apply_config_safe "$candidate"
+    pool=$(jq -ce .address <<< "$endpoint") || exit 1
+    if [ -z "$family" ]; then
+        family=$(jq -c '{endpoints:[.]}' <<< "$endpoint" | _warp_family) || exit 1
+    fi
+    _warp_apply_family "$family" "$endpoint" "$pool"
 )
 
 _toggle_geosite_rule() {
@@ -322,6 +400,7 @@ manage_warp() {
         printf "  %bWARP:%b %b  |  %b模式:%b %b\n" "$CYAN" "$NC" "$warp_st" "$CYAN" "$NC" "$mode_st"
         if _has_warp_outbound; then
             _show_warp_addresses
+            printf '  WARP 出口地址族: %s\n' "$(_warp_family_label "$(_warp_entry | _warp_family)")"
             printf '  %b公网出口 IP:%b %s\n' "$CYAN" "$NC" "${warp_exit_ip:-未检测，选 3 查询}"
         fi
         printf "  %b分流:%b 节点[%b%s%b] · AI[%b] · 流媒体[%b] · 域名[%b%s%b]\n\n" \
@@ -333,9 +412,10 @@ manage_warp() {
         menu_pair 5 "指定节点走 WARP" 6 "AI 分流开关"
         menu_pair 7 "流媒体分流开关" 8 "添加分流域名"
         menu_pair 9 "删除分流域名" 10 "彻底移除 WARP"
+        menu_single 11 "WARP 出口地址族"
         menu_single 0 "返回"
 
-        _read_menu_choice warp_opt "> 选择 [0-10]: "
+        _read_menu_choice warp_opt "> 选择 [0-11]: "
         case "$warp_opt" in
             1)
                 acquire_lock || continue
@@ -422,12 +502,22 @@ manage_warp() {
                   .route.rule_set = [.route.rule_set[]? | select(.tag != "geosite-ai" and .tag != "geosite-stream")] |
                   .route.rules = [.route.rules[]? | select(.outbound != "warp-out")]
                 ' "$CONFIG_FILE" > "$tmp_c" &&
-                jq '.warp_custom_domains = [] | .warp_nodes = []' "$STATE_FILE" > "$tmp_s" &&
+                jq '.warp_custom_domains = [] | .warp_nodes = [] | del(.warp_address_pool)' "$STATE_FILE" > "$tmp_s" &&
                 sbx_apply_config_safe "$tmp_c" "$tmp_s" && {
                     warp_exit_ip=""
                     printf '\n%b[OK] WARP 及分流规则已移除%b\n' "$GREEN" "$NC"
                 }
                 rm -f "$tmp_c" "$tmp_s"
+                pause_for_enter ;;
+            11)
+                local family choice
+                _read_menu_choice choice '出口地址族 [1 仅 IPv4 / 2 仅 IPv6 / 3 双栈 / 0 返回]: '
+                case "$choice" in
+                    1) family=ipv4 ;; 2) family=ipv6 ;; 3) family=dual ;; *) continue ;;
+                esac
+                printf '仅影响走 WARP 的流量，不改服务器接入地址。单栈不兼容另一地址族。\n'
+                confirm_action "切换到 $(_warp_family_label "$family")？如有变更会重启 sbx" || continue
+                _warp_change_family "$family" && _test_warp_connectivity
                 pause_for_enter ;;
             0) return 0 ;;
         esac

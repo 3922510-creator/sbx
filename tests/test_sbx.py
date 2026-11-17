@@ -41,6 +41,27 @@ class TestWarp(unittest.TestCase):
         self.assertEqual(endpoint["private_key"], "sample-key")
         self.assertEqual(endpoint["mtu"], 1280)
 
+    def test_warp_family_switch_round_trip_preserves_peer_mtu_and_addresses(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = self.run_shell(r'''
+                set -e
+                CONFIG_FILE="$1/config"; STATE_FILE="$1/state"
+                printf '%s\n' '{"endpoints":[{"type":"wireguard","tag":"warp-out","mtu":1280,"address":["172.16.0.2/32","2606:4700::2/128"],"peers":[{"address":"192.0.2.1","allowed_ips":["0.0.0.0/0","::/0"]}]}]}' > "$CONFIG_FILE"
+                printf '%s\n' '{"warp_nodes":["unchanged"]}' > "$STATE_FILE"
+                acquire_lock() { return 0; }
+                sbx_apply_config_safe() { mv -- "$1" "$CONFIG_FILE" && mv -- "$2" "$STATE_FILE"; }
+                for mode in ipv4 ipv6 dual; do
+                    _warp_change_family "$mode"
+                    [[ $(_warp_entry | _warp_family) == "$mode" ]]
+                    jq -e --arg mode "$mode" '.endpoints[0] | .mtu==1280 and .peers[0].address=="192.0.2.1" and
+                      (.peers[0].allowed_ips == ({ipv4:["0.0.0.0/0"],ipv6:["::/0"],dual:["0.0.0.0/0","::/0"]}[$mode]))' "$CONFIG_FILE" >/dev/null
+                done
+                jq -e '.warp_nodes == ["unchanged"] and (.warp_address_pool | length)==2' "$STATE_FILE"
+                jq -e '.endpoints[0].address==["172.16.0.2/32","2606:4700::2/128"]' "$CONFIG_FILE"
+                if _warp_endpoint_for_family ipv6 '["172.16.0.2/32"]' <<<'{}'; then exit 1; fi
+            ''', d)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_sync_keeps_other_rules_and_skips_deleted_nodes(self):
         ai = {"outbound": "warp-out", "rule_set": "geosite-ai"}
         with tempfile.TemporaryDirectory() as d:
@@ -103,14 +124,20 @@ class TestWarp(unittest.TestCase):
                 printf '%s\n' '{"outbounds":[{"type":"direct","tag":"warp-out"}]}' > "$CONFIG_FILE"
                 curl() {
                     [[ "$*" =~ socks5h://127\.0\.0\.1:[1-9][0-9]+ && "$*" == *--noproxy* ]] || return 1
-                    printf 'ip=198.51.100.5\ncolo=SJC\nwarp=%s\n' "$trace_flag"
+                    case "$*" in
+                        *1.1.1.1*) printf 'ip=198.51.100.5\n' ;;
+                        *2606:4700:4700::1111*) printf 'ip=2001:db8::5\n' ;;
+                        *) return 1 ;;
+                    esac
+                    printf 'colo=SJC\nwarp=%s\n' "$trace_flag"
                 }
                 trace_flag=off; ! _probe_warp
                 trace_flag=on; _probe_warp
             ''', d, shutil.which("sing-box"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("未确认流量经过 WARP", result.stderr)
-        self.assertIn("198.51.100.5", result.stdout)
+        self.assertIn("IPv4 198.51.100.5", result.stdout)
+        self.assertIn("IPv6 2001:db8::5", result.stdout)
 
 
 class TestSBX(unittest.TestCase):
