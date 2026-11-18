@@ -46,7 +46,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/3922510-creator/sbx/main/ins
 ### 3. Sing-box 代理管理
 - **VLESS-Reality 节点搭建**：自动安装最新官方核心，自动生成 Reality 密钥对、UUID、短 ID 与伪装域名，生成客户端分享链接与终端二维码。
 - **TCP / UDP 端口转发**：基于 Sing-box direct 模式的轻量中转，支持自定义本机监听端口与目标地址。
-- **WARP 出口分流**：支持全局、指定节点、AI、流媒体和自定义域名分流。接入后会检测公网出口，也可从 WARP 菜单选 `3` 重新查询。面板区分 WireGuard 隧道地址和 Cloudflare Trace 实测的公网出口 IP；检测使用独立的临时回环代理，不会切换现有服务的分流模式。选 `11` 可切换仅 IPv4、仅 IPv6 或双栈（新注册且获得两种地址时默认双栈）；只影响 WARP 流量，不更改服务器到 Cloudflare 的接入地址，单栈不兼容另一地址族。
+- **WARP 出口分流**：只注册 Cloudflare Zero Trust。选 `1` 使用组织邮箱验证码登录（交互式 SSH，需 `python3`、`openssl`）；默认接入 `162.159.193.1:2408/UDP`，已有普通 WARP 需重新登录替换，不会自动开启分流。支持全局、指定节点、AI、流媒体和自定义域名分流。接入后会检测公网出口，也可从 WARP 菜单选 `3` 重新查询。面板区分 WireGuard 隧道地址和 Cloudflare Trace 实测的公网出口 IP；检测使用独立的临时回环代理，不会切换现有服务的分流模式。选 `11` 可切换仅 IPv4、仅 IPv6 或双栈（新注册且获得两种地址时默认双栈）；只影响 WARP 流量，不更改服务器到 Cloudflare 的接入地址，单栈不兼容另一地址族。
 - **核心与服务维护**：查看实时运行状态与日志，配置语法自动校验与历史备份一键回滚。
 
 ### 4. 彻底卸载与残留清理
