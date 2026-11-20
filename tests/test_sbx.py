@@ -26,22 +26,49 @@ class TestWarp(unittest.TestCase):
             input=input, capture_output=True, text=True, timeout=8,
         )
 
-    def test_zero_trust_only_registration_and_apply_confirmation(self):
-        result = self.run_shell(r'''
-            set -e
-            _warp_entry() { return 1; }
-            _zero_trust_enroll() {
-                printf '%s\n' '{"type":"wireguard","tag":"warp-out","address":["172.16.0.2/32","2606:4700::2/128"],"peers":[{"address":"162.159.193.1","port":2408,"reserved":[1,2,3]}]}' > "$1"
-            }
-            install_singbox_bin() { :; }; deploy_sbx_service() { :; }
-            _warp_apply_family() { printf '%s\n' "$1"; jq -r '.peers[0].address' <<< "$2"; }
-            confirm_action() { return 1; }
-            if _register_warp; then exit 1; fi
-            confirm_action() { return 0; }
-            _register_warp
-        ''')
+    def test_registration_requires_real_addresses_and_peer_key(self):
+        cmd = '_warp_registration_endpoint sample-key'
+        invalid = self.run_shell(cmd, input='{"errors": []}')
+        self.assertNotEqual(invalid.returncode, 0)
+        response = {"config": {
+            "client_id": "1fbA",
+            "interface": {"addresses": {"v4": "172.16.0.2", "v6": "2606:4700::2"}},
+            "peers": [{"public_key": "a" * 43 + "="}],
+        }}
+        result = self.run_shell(cmd, input=json.dumps(response))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["dual", "162.159.193.1"])
+        endpoint = json.loads(result.stdout)
+        self.assertEqual(endpoint["address"], ["172.16.0.2/32", "2606:4700::2/128"])
+        self.assertEqual(endpoint["private_key"], "sample-key")
+        self.assertEqual(endpoint["mtu"], 1280)
+        self.assertEqual(endpoint["peers"][0]["address"], "162.159.192.8")
+        self.assertEqual(endpoint["peers"][0]["reserved"], [213, 246, 192])
+
+    def test_free_warp_registration_flow_and_no_zero_trust(self):
+        content = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("_zero_trust_enroll", content)
+        self.assertNotIn("Zero Trust", content)
+        with tempfile.TemporaryDirectory() as d:
+            stub = Path(d) / "sing-box"
+            stub.write_text('#!/usr/bin/env bash\nprintf "PrivateKey: priv-key-sample\\nPublicKey: pub-key-sample\\n"\n')
+            stub.chmod(0o755)
+            result = self.run_shell(r'''
+                set -e
+                BIN_FILE="$1"
+                _warp_entry() { return 1; }
+                curl() {
+                    [[ "$*" == *api.cloudflareclient.com/v0a2158/reg* ]] || return 1
+                    printf '{"config":{"client_id":"1fbA","interface":{"addresses":{"v4":"172.16.0.2","v6":"2606:4700::2"}},"peers":[{"public_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa="}]}}\n'
+                }
+                _warp_apply_family() {
+                    printf '%s\n' "$1"
+                    jq -r '.peers[0].address' <<< "$2"
+                    jq -c '.peers[0].reserved' <<< "$2"
+                }
+                _register_warp
+            ''', str(stub))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["dual", "162.159.192.8", "[213,246,192]"])
 
     def test_warp_family_switch_round_trip_preserves_peer_mtu_and_addresses(self):
         with tempfile.TemporaryDirectory() as d:

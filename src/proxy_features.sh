@@ -320,22 +320,67 @@ _test_warp_connectivity() {
     printf '  %b公网出口 IP:%b %s\n' "$GREEN" "$NC" "$warp_exit_ip"
 }
 
+_warp_decode_reserved() {
+    local cid="$1" bytes
+    [[ "$cid" =~ ^[A-Za-z0-9+/=]{4,8}$ ]] || { printf '[]\n'; return 0; }
+    bytes=$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -v -tu1 2>/dev/null | awk '
+        { for (i = 1; i <= NF; i++) { a[++n] = $i } }
+        END {
+            if (n == 3) printf "[%s,%s,%s]\n", a[1], a[2], a[3]
+            else print "[]"
+        }
+    ')
+    printf '%s\n' "${bytes:-[]}"
+}
+
+_warp_registration_endpoint() {
+    local payload reserved
+    payload=$(cat)
+    reserved=$(_warp_decode_reserved "$(jq -r '.config.client_id // empty' <<< "$payload" 2>/dev/null)")
+    # Leave room for WireGuard encapsulation to avoid sendmmsg: message too long.
+    jq -ce --rawfile priv /dev/fd/3 --argjson reserved "$reserved" '
+      .config.interface.addresses as $addr | .config.peers[0].public_key as $peer |
+      select(($addr.v4 | strings | test("^[0-9]+(\\.[0-9]+){3}$")) and
+        ($peer | strings | test("^[A-Za-z0-9+/]{43}=$"))) |
+      {type: "wireguard", tag: "warp-out", mtu: 1280, private_key: ($priv | rtrimstr("\n")),
+        address: ([$addr.v4 + "/32"] + (if ($addr.v6 // "") == "" then [] else [$addr.v6 + "/128"] end)),
+        peers: [({address: "162.159.192.8", port: 2408, public_key: $peer, allowed_ips: ["0.0.0.0/0", "::/0"]} +
+          (if ($reserved | length) == 3 then {reserved: $reserved} else {} end))]}
+    ' 3<<< "$1" <<< "$payload"
+}
+
 _register_warp() (
     set +x
     umask 077
-    local dir endpoint family pool
+    local keys priv pub id payload response endpoint family pool
     family=$(_warp_entry | _warp_family) || family=""
-    dir=$(mktemp -d) || exit 1
-    trap 'rm -rf -- "$dir"' EXIT
-    trap 'exit 1' HUP INT TERM
-    _zero_trust_enroll "$dir/endpoint.json" || exit 1
-    endpoint=$(cat "$dir/endpoint.json") || exit 1
+    keys=$("$BIN_FILE" generate wg-keypair 2>/dev/null) || {
+        printf '%b[!] 生成 WireGuard 密钥失败%b\n' "$RED" "$NC"
+        exit 1
+    }
+    read -r priv pub < <(awk '/^PrivateKey:/{p=$2} /^PublicKey:/{q=$2} END{print p, q}' <<< "$keys")
+    if [ -z "$priv" ] || [ -z "$pub" ]; then
+        printf '%b[!] 生成 WireGuard 密钥失败%b\n' "$RED" "$NC"
+        exit 1
+    fi
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        read -r id < /proc/sys/kernel/random/uuid || exit 1
+    else
+        id=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+    fi
+    payload=$(jq -nc --arg key "$pub" --arg id "${id//-/}" '
+      {key: $key, install_id: $id, fcm_token: "", tos: (now | todateiso8601), model: "Linux", serial_number: $id, locale: "en_US"}
+    ') || exit 1
+    if ! response=$(curl -qfsS --connect-timeout 8 --max-time 20 https://api.cloudflareclient.com/v0a2158/reg \
+      -H 'User-Agent: okhttp/3.12.1' -H 'CF-Client-Version: a-6.3-2158' -H 'Content-Type: application/json' --data "$payload") ||
+       ! endpoint=$(_warp_registration_endpoint "$priv" <<< "$response" 2>/dev/null); then
+        printf '%b[!] WARP 注册失败或返回缺少地址/公钥，原配置未改动%b\n' "$RED" "$NC"
+        exit 1
+    fi
     pool=$(jq -ce .address <<< "$endpoint") || exit 1
     if [ -z "$family" ]; then
         family=$(jq -c '{endpoints:[.]}' <<< "$endpoint" | _warp_family) || exit 1
     fi
-    confirm_action "应用 Zero Trust 端点并重启 SBX？保留当前分流及默认出口。" || exit 1
-    install_singbox_bin && deploy_sbx_service || exit 1
     _warp_apply_family "$family" "$endpoint" "$pool"
 )
 
@@ -387,7 +432,7 @@ manage_warp() {
         printf "  %b分流:%b 节点[%b%s%b] · AI[%b] · 流媒体[%b] · 域名[%b%s%b]\n\n" \
             "$CYAN" "$NC" "$YELLOW" "$node_cnt" "$NC" "$ai_tag" "$stream_tag" "$CYAN" "$dom_cnt" "$NC"
 
-        menu_pair 1 "Zero Trust 登录/重置" 2 "查看规则详情"
+        menu_pair 1 "接入/重置 WARP" 2 "查看规则详情"
         menu_pair 3 "查询 WARP 公网 IP" 4 "全局 WARP 开关"
         print_divider
         menu_pair 5 "指定节点走 WARP" 6 "AI 分流开关"
@@ -399,8 +444,10 @@ manage_warp() {
         _read_menu_choice warp_opt "> 选择 [0-11]: "
         case "$warp_opt" in
             1)
-                confirm_action "通过邮箱验证码注册 Zero Trust 设备？将下载并校验固定版本登录组件。" || continue
                 acquire_lock || continue
+                install_singbox_bin || continue
+                deploy_sbx_service
+                printf '\n%b>>> 注册 Cloudflare WARP...%b\n' "$CYAN" "$NC"
                 if _register_warp; then
                     printf '\n%b[OK] WARP 端点已就绪%b\n' "$GREEN" "$NC"
                     _test_warp_connectivity
